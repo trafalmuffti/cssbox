@@ -9,7 +9,7 @@ use crate::fragment::{Fragment, FragmentKind};
 use crate::geometry::{Point, Size};
 use crate::inline;
 use crate::layout::{self, LayoutContext};
-use crate::style::{BoxSizing, Float};
+use crate::style::{BoxSizing, DisplayInner, Float};
 use crate::tree::{FormattingContextType, NodeId};
 
 /// Layout a block-level element and its children.
@@ -21,6 +21,7 @@ pub fn layout_block(
 ) -> Fragment {
     let style = ctx.tree.style(node);
     let mut fragment = Fragment::new(node, FragmentKind::Box);
+    let forced_height = ctx.take_forced_height(node);
 
     // 1. Resolve width and margins
     let (content_width, margin) = resolve_block_width(style, containing_block_width);
@@ -37,14 +38,25 @@ pub fn layout_block(
     let fc_type = ctx.tree.formatting_context(node);
 
     let mut float_ctx = FloatContext::new(content_width);
+    // Floats from an ancestor in the same block formatting context intrude
+    // into this block's line boxes.
+    for (rect, side) in ctx.take_floats(node) {
+        if !style.establishes_bfc() {
+            float_ctx.add_exclusion(rect, side);
+        }
+    }
 
-    let content_height = match fc_type {
-        FormattingContextType::Inline => layout_inline_children(
-            ctx,
-            node,
-            content_width,
-            &mut fragment.children,
-            &mut float_ctx,
+    let (mut content_height, first_margin_top, last_margin_bottom) = match fc_type {
+        FormattingContextType::Inline => (
+            layout_inline_children(
+                ctx,
+                node,
+                content_width,
+                &mut fragment.children,
+                &mut float_ctx,
+            ),
+            None,
+            0.0,
         ),
         _ => layout_block_children(
             ctx,
@@ -56,6 +68,44 @@ pub fn layout_block(
         ),
     };
 
+    // Parent/child margin collapsing (CSS 2.1 §8.3.1): a block without top
+    // border/padding that does not establish a BFC shares its first child's
+    // top margin; likewise at the bottom for auto-height blocks.
+    let independent = style.establishes_bfc()
+        || matches!(
+            style.display.inner,
+            DisplayInner::TableCell | DisplayInner::TableCaption
+        )
+        || node == ctx.tree.root()
+        || ctx.tree.parent(node).is_some_and(|p| {
+            matches!(
+                ctx.tree.style(p).display.inner,
+                DisplayInner::Flex | DisplayInner::Grid
+            )
+        });
+    if !independent && border.top == 0.0 && padding.top == 0.0 {
+        if let Some(first) = first_margin_top {
+            for child in &mut fragment.children {
+                child.position.y -= first;
+                if ctx.tree.style(child.node).float != Float::None {
+                    child.position.y = child.position.y.max(child.margin.top);
+                }
+            }
+            content_height -= first;
+            fragment.margin.top = collapse_margins(fragment.margin.top, first);
+        }
+    }
+    let collapse_bottom = !independent
+        && border.bottom == 0.0
+        && padding.bottom == 0.0
+        && style.height.is_auto()
+        && forced_height.is_none();
+    if collapse_bottom {
+        fragment.margin.bottom = collapse_margins(fragment.margin.bottom, last_margin_bottom);
+    } else {
+        content_height += last_margin_bottom;
+    }
+
     // 4. Resolve height
     let specified_height = style.height.resolve(containing_block_height);
     let mut final_height = match specified_height {
@@ -65,7 +115,10 @@ pub fn layout_block(
             }
             h
         }
-        None => content_height,
+        None => match forced_height {
+            Some(h) => (h - border.vertical() - padding.vertical()).max(0.0),
+            None => content_height,
+        },
     };
 
     // Apply min/max height
@@ -87,6 +140,10 @@ pub fn layout_block(
 }
 
 /// Layout block-level children within a block formatting context.
+///
+/// Returns the content height (excluding the last child's bottom margin), the
+/// first in-flow child's top margin (if it may collapse with the parent) and
+/// the trailing bottom margin.
 fn layout_block_children(
     ctx: &LayoutContext,
     parent: NodeId,
@@ -94,11 +151,13 @@ fn layout_block_children(
     containing_height: f32,
     fragments: &mut Vec<Fragment>,
     float_ctx: &mut FloatContext,
-) -> f32 {
+) -> (f32, Option<f32>, f32) {
     let children = ctx.tree.children(parent);
     let mut cursor_y: f32 = 0.0;
-    let mut prev_margin_bottom: f32 = 0.0;
-    let mut is_first_child = true;
+    // Pending (uncollapsed) bottom margin of the previous in-flow child.
+    let mut pending_margin: Option<f32> = None;
+    let mut first_margin_top: Option<f32> = None;
+    let mut seen_in_flow = false;
 
     for &child_id in children {
         let child_style = ctx.tree.style(child_id);
@@ -120,57 +179,78 @@ fn layout_block_children(
 
         // Handle floats
         if child_style.float != Float::None {
-            let child_fragment =
+            let mut child_fragment =
                 layout::layout_node(ctx, child_id, containing_width, containing_height);
-            let floated = float_ctx.place_float(child_fragment, child_style.float, cursor_y);
+            // Floats keep their specified margins (no over-constrained
+            // adjustment as for in-flow blocks); auto margins are zero.
+            child_fragment.margin = BoxModel::resolve_margin(child_style, containing_width);
+            let float_y = cursor_y + pending_margin.unwrap_or(0.0).max(0.0);
+            let floated = float_ctx.place_float(child_fragment, child_style.float, float_y);
             fragments.push(floated);
             continue;
         }
 
-        // Handle clear
-        if child_style.clear != crate::style::Clear::None {
-            let clear_y = float_ctx.clear(child_style.clear);
-            cursor_y = cursor_y.max(clear_y);
+        // Hand active floats down so the child's line boxes flow around them.
+        if float_ctx.has_floats() && !child_style.establishes_bfc() {
+            let bm = BoxModel::resolve(child_style, containing_width);
+            let est_offset = match pending_margin {
+                Some(prev) => collapse_margins(prev, bm.margin.top),
+                None => bm.margin.top,
+            };
+            let dx = bm.margin.left + bm.border.left + bm.padding.left;
+            let dy = cursor_y + est_offset + bm.border.top + bm.padding.top;
+            ctx.pass_floats(child_id, float_ctx.exclusions_for_child(dx, dy));
         }
 
         // Layout the child
         let mut child_fragment =
             layout::layout_node(ctx, child_id, containing_width, containing_height);
+        let margin_top = child_fragment.margin.top;
+        let margin_bottom = child_fragment.margin.bottom;
 
-        // Margin collapsing (CSS 2.1 §8.3.1)
-        let child_margin_top = child_fragment.margin.top;
-        let collapsed_margin = collapse_margins(prev_margin_bottom, child_margin_top);
+        // Margin collapsing between adjacent siblings (CSS 2.1 §8.3.1).
+        let mut offset = match pending_margin.take() {
+            Some(prev) => collapse_margins(prev, margin_top),
+            None => {
+                if !seen_in_flow {
+                    first_margin_top = Some(margin_top);
+                }
+                margin_top
+            }
+        };
+        seen_in_flow = true;
 
-        if is_first_child {
-            // First child: potentially collapse with parent's top margin
-            // (simplified — full collapsing is more complex)
-            cursor_y += child_margin_top;
-        } else {
-            // Collapse adjacent sibling margins
-            cursor_y -= prev_margin_bottom;
-            cursor_y += collapsed_margin;
+        // Handle clear
+        if child_style.clear != crate::style::Clear::None {
+            let clear_y = float_ctx.clear(child_style.clear);
+            if cursor_y + offset < clear_y {
+                offset = clear_y - cursor_y;
+                first_margin_top = None;
+            }
         }
+        cursor_y += offset;
 
-        // Position the child
-        child_fragment.position = Point::new(
-            child_fragment.margin.left + child_fragment.border.left + child_fragment.padding.left
-                - child_fragment.border.left
-                - child_fragment.padding.left,
-            cursor_y,
-        );
-        // Actually, position is the top-left of the border box, including margin offset
+        // Position is the top-left of the border box, offset by the left margin.
         child_fragment.position = Point::new(child_fragment.margin.left, cursor_y);
 
-        // Advance cursor
-        cursor_y += child_fragment.border_box().height;
-        prev_margin_bottom = child_fragment.margin.bottom;
-        is_first_child = false;
+        let height = child_fragment.border_box().height;
+        if height == 0.0 {
+            // An empty block's own top and bottom margins collapse together
+            // and carry on to the next sibling. (It no longer collapses with
+            // the parent; a simplification.)
+            cursor_y -= offset;
+            child_fragment.position.y = cursor_y;
+            pending_margin = Some(collapse_margins(offset, margin_bottom));
+            first_margin_top = None;
+        } else {
+            cursor_y += height;
+            pending_margin = Some(margin_bottom);
+        }
 
         fragments.push(child_fragment);
     }
 
-    // Account for last child's bottom margin (may collapse with parent)
-    cursor_y
+    (cursor_y, first_margin_top, pending_margin.unwrap_or(0.0))
 }
 
 /// Layout inline-level children within a block container.
@@ -347,5 +427,46 @@ mod tests {
 
         let child_rect = result.bounding_rect(child).unwrap();
         assert_eq!(child_rect.width, 500.0); // clamped by max-width
+    }
+
+    #[test]
+    fn test_sibling_margins_collapse() {
+        let mut builder = BoxTreeBuilder::new();
+        let root = builder.root(ComputedStyle::block());
+        let mut a = ComputedStyle::block();
+        a.height = LengthPercentageAuto::px(10.0);
+        a.margin_bottom = LengthPercentageAuto::px(20.0);
+        let a = builder.element(root, a);
+        let mut b = ComputedStyle::block();
+        b.height = LengthPercentageAuto::px(10.0);
+        b.margin_top = LengthPercentageAuto::px(15.0);
+        b.margin_bottom = LengthPercentageAuto::px(5.0);
+        let b = builder.element(root, b);
+        let tree = builder.build();
+        let result = compute_layout(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
+        assert_eq!(result.bounding_rect(a).unwrap().y, 0.0);
+        // max(20, 15) between them.
+        assert_eq!(result.bounding_rect(b).unwrap().y, 30.0);
+        // The root is a BFC: the last bottom margin stays inside it.
+        assert_eq!(result.bounding_rect(root).unwrap().height, 45.0);
+    }
+
+    #[test]
+    fn test_parent_child_margin_collapse() {
+        let mut builder = BoxTreeBuilder::new();
+        let root = builder.root(ComputedStyle::block());
+        let mut outer = ComputedStyle::block();
+        outer.margin_top = LengthPercentageAuto::px(8.0);
+        let outer = builder.element(root, outer);
+        let mut inner = ComputedStyle::block();
+        inner.height = LengthPercentageAuto::px(10.0);
+        inner.margin_top = LengthPercentageAuto::px(20.0);
+        let inner = builder.element(outer, inner);
+        let tree = builder.build();
+        let result = compute_layout(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
+        // The 8px and 20px margins collapse to 20px.
+        assert_eq!(result.bounding_rect(outer).unwrap().y, 20.0);
+        assert_eq!(result.bounding_rect(inner).unwrap().y, 20.0);
+        assert_eq!(result.bounding_rect(outer).unwrap().height, 10.0);
     }
 }

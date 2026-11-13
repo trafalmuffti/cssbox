@@ -55,16 +55,20 @@ pub fn layout_flex(
     let is_wrap = style.flex_wrap != FlexWrap::Nowrap;
     let _is_wrap_reverse = style.flex_wrap == FlexWrap::WrapReverse;
 
-    let main_size = if is_row {
-        content_box_width
-    } else {
-        style
-            .height
-            .resolve(containing_block_height)
-            .unwrap_or(containing_block_height)
+    // A definite content height: specified, or imposed by a parent flex container.
+    let forced = ctx.take_forced_height(node);
+    let definite_height = match style.height.resolve(containing_block_height) {
+        Some(mut h) => {
+            if style.box_sizing == BoxSizing::BorderBox {
+                h = (h - border.vertical() - padding.vertical()).max(0.0);
+            }
+            Some(h)
+        }
+        None => forced.map(|h| (h - border.vertical() - padding.vertical()).max(0.0)),
     };
+
     let cross_size_available = if is_row {
-        style.height.resolve(containing_block_height)
+        definite_height
     } else {
         Some(content_box_width)
     };
@@ -99,6 +103,18 @@ pub fn layout_flex(
     // §9.3: Determine the flex base size and hypothetical main size
     // (already done in collect_flex_item)
 
+    // §9.2: the main size; an auto-height column sizes to its content.
+    let main_size = if is_row {
+        content_box_width
+    } else {
+        definite_height.unwrap_or_else(|| {
+            items
+                .iter()
+                .map(|i| i.hypothetical_main_size + i.main_margin())
+                .sum()
+        })
+    };
+
     // §9.4: Determine the main size of the flex container (already done above)
 
     // §9.5: Collect flex items into flex lines
@@ -132,6 +148,14 @@ pub fn layout_flex(
             max_cross = max_cross.max(cross);
         }
         line_cross_sizes.push(max_cross);
+    }
+
+    // §9.4 step 15: a single-line container with a definite cross size gives
+    // its line the container's inner cross size.
+    if !is_wrap && line_cross_sizes.len() == 1 {
+        if let Some(c) = cross_size_available {
+            line_cross_sizes[0] = c;
+        }
     }
 
     // Determine final cross size of container
@@ -175,12 +199,27 @@ pub fn layout_flex(
             let item = &items[item_idx];
             let item_main = resolved.sizes[&item_idx];
 
-            // Layout the item
+            // Layout the item. Widths passed down act as the containing block
+            // width, so include the item's main-axis margins/padding/border to
+            // make an auto width resolve to `item_main`.
+            let align = effective_align(style.align_items, ctx.tree.style(item.node).align_self);
+            let item_style = ctx.tree.style(item.node);
+            let item_box = BoxModel::resolve(item_style, content_box_width);
             let (item_width, item_height) = if is_row {
-                (item_main, line_cross)
+                (item_main + item.main_margin(), line_cross)
             } else {
                 (line_cross, item_main)
             };
+            if is_row {
+                if align == AlignItems::Stretch && item_style.height.is_auto() {
+                    ctx.force_height(item.node, line_cross - item_box.margin.vertical());
+                }
+            } else {
+                ctx.force_height(
+                    item.node,
+                    item_main + item_box.padding.vertical() + item_box.border.vertical(),
+                );
+            }
 
             let mut child_frag = layout_flex_item(
                 ctx,
@@ -193,11 +232,10 @@ pub fn layout_flex(
             );
 
             // Cross-axis alignment (align-items / align-self)
-            let align = effective_align(style.align_items, ctx.tree.style(item.node).align_self);
             let item_cross = if is_row {
-                child_frag.border_box().height
+                child_frag.border_box().height + child_frag.margin.vertical()
             } else {
-                child_frag.border_box().width
+                child_frag.border_box().width + child_frag.margin.horizontal()
             };
             let cross_align_offset = match align {
                 AlignItems::FlexStart | AlignItems::Start => 0.0,
@@ -229,10 +267,7 @@ pub fn layout_flex(
 
     // Set container size
     let content_height = if is_row { container_cross } else { main_size };
-    let final_height = style
-        .height
-        .resolve(containing_block_height)
-        .unwrap_or(content_height);
+    let final_height = definite_height.unwrap_or(content_height);
 
     let min_h = style.min_height.resolve(containing_block_height);
     let max_h = style
@@ -256,11 +291,14 @@ struct FlexItem {
     max_main: f32,
     main_margin_start: f32,
     main_margin_end: f32,
+    /// Padding + border along the main axis.
+    main_padding_border: f32,
 }
 
 impl FlexItem {
+    /// Everything outside the content box along the main axis.
     fn main_margin(&self) -> f32 {
-        self.main_margin_start + self.main_margin_end
+        self.main_margin_start + self.main_margin_end + self.main_padding_border
     }
 }
 
@@ -343,6 +381,12 @@ fn collect_flex_item(
         (box_model.margin.top, box_model.margin.bottom)
     };
 
+    let main_padding_border = if is_row {
+        box_model.padding.horizontal() + box_model.border.horizontal()
+    } else {
+        box_model.padding.vertical() + box_model.border.vertical()
+    };
+
     FlexItem {
         node,
         flex_base_size,
@@ -353,6 +397,7 @@ fn collect_flex_item(
         max_main,
         main_margin_start,
         main_margin_end,
+        main_padding_border,
     }
 }
 
@@ -704,5 +749,41 @@ mod tests {
         let (start, between) = distribute_justify(JustifyContent::SpaceEvenly, 400.0, 3);
         assert_eq!(start, 100.0);
         assert_eq!(between, 100.0);
+    }
+
+    #[test]
+    fn test_flex_align_center_and_stretch() {
+        use crate::style::{AlignItems, Display, FlexDirection};
+        let mut builder = BoxTreeBuilder::new();
+        let mut root_style = ComputedStyle::block();
+        root_style.display = Display::FLEX;
+        root_style.height = LengthPercentageAuto::px(100.0);
+        root_style.align_items = AlignItems::Center;
+        let root = builder.root(root_style);
+        let mut small = ComputedStyle::block();
+        small.width = LengthPercentageAuto::px(20.0);
+        small.height = LengthPercentageAuto::px(20.0);
+        let small = builder.element(root, small);
+        // A stretched column whose child grows to fill it.
+        let mut column = ComputedStyle::block();
+        column.display = Display::FLEX;
+        column.flex_direction = FlexDirection::Column;
+        column.width = LengthPercentageAuto::px(50.0);
+        column.align_self = crate::style::AlignSelf::Stretch;
+        let column = builder.element(root, column);
+        let mut fixed = ComputedStyle::block();
+        fixed.height = LengthPercentageAuto::px(30.0);
+        builder.element(column, fixed);
+        let mut grow = ComputedStyle::block();
+        grow.flex_grow = 1.0;
+        grow.flex_basis = LengthPercentageAuto::px(0.0);
+        let grow = builder.element(column, grow);
+        let tree = builder.build();
+        let result = compute_layout(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
+        assert_eq!(result.bounding_rect(small).unwrap().y, 40.0);
+        assert_eq!(result.bounding_rect(column).unwrap().height, 100.0);
+        let g = result.bounding_rect(grow).unwrap();
+        assert_eq!(g.y, 30.0);
+        assert_eq!(g.height, 70.0);
     }
 }

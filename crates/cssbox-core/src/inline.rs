@@ -94,7 +94,7 @@ pub fn layout_inline_formatting_context(
     parent: NodeId,
     containing_width: f32,
     fragments: &mut Vec<Fragment>,
-    _float_ctx: &mut FloatContext,
+    float_ctx: &mut FloatContext,
 ) -> f32 {
     let parent_style = ctx.tree.style(parent);
     let text_align = parent_style.text_align;
@@ -105,20 +105,21 @@ pub fn layout_inline_formatting_context(
     let mut inline_items = Vec::new();
     collect_inline_items(ctx, parent, containing_width, &mut inline_items);
 
-    // Break into line boxes
-    let mut line_boxes = Vec::new();
-    break_into_lines(
+    // Break into line boxes, narrowing each line by any floats beside it.
+    let line_boxes = flow_lines(
         &inline_items,
         containing_width,
+        line_height,
         white_space,
-        &mut line_boxes,
+        float_ctx,
     );
 
     // Position line boxes and create fragments
-    let mut current_y = 0.0;
     let line_count = line_boxes.len();
 
-    for (line_idx, line_box) in line_boxes.iter().enumerate() {
+    for (line_idx, (line_box, line_y, line_left, line_width)) in line_boxes.iter().enumerate() {
+        let current_y = *line_y;
+        let containing_width = *line_width;
         let line_height_actual = line_box.height.max(line_height);
         // Extra leading is split evenly above and below the content.
         let half_leading = ((line_height_actual - line_box.height) / 2.0).max(0.0);
@@ -136,7 +137,7 @@ pub fn layout_inline_formatting_context(
 
         // Create line box fragment
         let mut line_fragment = Fragment::new(parent, FragmentKind::LineBox);
-        line_fragment.position = Point::new(0.0, current_y);
+        line_fragment.position = Point::new(*line_left, current_y);
         line_fragment.size = Size::new(containing_width, line_height_actual);
 
         // Position items within line
@@ -191,11 +192,75 @@ pub fn layout_inline_formatting_context(
             line_fragment.children.push(item_fragment);
         }
 
-        current_y += line_height_actual;
         fragments.push(line_fragment);
     }
 
-    current_y
+    line_boxes
+        .last()
+        .map(|(lb, y, _, _)| y + lb.height.max(line_height))
+        .unwrap_or(0.0)
+}
+
+/// Greedy line breaking where each line's available width can be reduced by
+/// floats. Returns (line, y, left offset, available width) per line.
+fn flow_lines(
+    items: &[InlineItem],
+    containing_width: f32,
+    line_height: f32,
+    white_space: WhiteSpace,
+    float_ctx: &FloatContext,
+) -> Vec<(LineBox, f32, f32, f32)> {
+    let mut out = Vec::new();
+    if items.is_empty() {
+        return out;
+    }
+    let allow_wrapping = white_space.wraps();
+    let floats = float_ctx.has_floats();
+    let mut y = 0.0f32;
+    let mut idx = 0;
+    while idx < items.len() {
+        let probe = line_height.max(1.0);
+        let (mut left, mut avail) = if floats {
+            float_ctx.available_width_at(y, probe)
+        } else {
+            (0.0, containing_width)
+        };
+        // If the next item cannot fit beside the floats, move below them.
+        if floats && allow_wrapping {
+            let first_w = items[idx].size.width;
+            let mut guard = 0;
+            while first_w > avail && avail < containing_width - 0.5 && guard < 64 {
+                let ny = float_ctx.next_y_after(y, probe);
+                if ny <= y {
+                    break;
+                }
+                y = ny;
+                let a = float_ctx.available_width_at(y, probe);
+                left = a.0;
+                avail = a.1;
+                guard += 1;
+            }
+        }
+        let mut line = LineBox::new();
+        while idx < items.len() {
+            let item = &items[idx];
+            if item.forced_break {
+                line.add_item(item.clone());
+                idx += 1;
+                break;
+            }
+            if line.is_empty() || !allow_wrapping || line.used_width() + item.size.width <= avail {
+                line.add_item(item.clone());
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+        let h = line.height.max(line_height);
+        out.push((line, y, left, avail));
+        y += h;
+    }
+    out
 }
 
 /// Collect inline items from the children of a parent node.
@@ -294,51 +359,6 @@ fn collect_inline_items(
     }
 }
 
-/// Break inline items into line boxes using greedy line breaking.
-fn break_into_lines(
-    items: &[InlineItem],
-    containing_width: f32,
-    white_space: WhiteSpace,
-    line_boxes: &mut Vec<LineBox>,
-) {
-    if items.is_empty() {
-        return;
-    }
-
-    let allow_wrapping = white_space.wraps();
-    let mut current_line = LineBox::new();
-
-    for item in items {
-        if item.forced_break {
-            current_line.add_item(item.clone());
-            line_boxes.push(std::mem::replace(&mut current_line, LineBox::new()));
-            continue;
-        }
-        let item_width = item.size.width;
-
-        // Check if item fits on current line
-        let fits =
-            current_line.is_empty() || current_line.used_width() + item_width <= containing_width;
-
-        if fits || !allow_wrapping {
-            // Add to current line
-            current_line.add_item(item.clone());
-        } else {
-            // Start new line
-            if !current_line.is_empty() {
-                line_boxes.push(current_line);
-            }
-            current_line = LineBox::new();
-            current_line.add_item(item.clone());
-        }
-    }
-
-    // Push final line
-    if !current_line.is_empty() {
-        line_boxes.push(current_line);
-    }
-}
-
 /// Calculate horizontal offset for text alignment.
 fn calculate_text_align_offset(
     align: TextAlign,
@@ -388,11 +408,7 @@ mod tests {
         builder.text(root, "Hello");
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(800.0);
@@ -414,11 +430,7 @@ mod tests {
         builder.text(root, "Test");
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(50.0);
@@ -443,11 +455,7 @@ mod tests {
         builder.text(root, "Hi");
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(800.0);
@@ -469,11 +477,7 @@ mod tests {
         builder.text(root, "Hi");
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(800.0);
@@ -497,11 +501,7 @@ mod tests {
         builder.text(root, "CCCCCCCCCCCC");
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(100.0);
@@ -529,11 +529,7 @@ mod tests {
         builder.text(root, "Test");
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(800.0);
@@ -567,11 +563,7 @@ mod tests {
 
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(800.0);
@@ -590,11 +582,7 @@ mod tests {
         let root = builder.root(ComputedStyle::block());
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(800.0);
@@ -616,11 +604,7 @@ mod tests {
         builder.text(root, "C");
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(10.0);
@@ -643,11 +627,7 @@ mod tests {
         builder.text(root, "B");
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(800.0);
@@ -671,11 +651,7 @@ mod tests {
         let img_id = builder.element(root, img);
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(800.0);
@@ -700,5 +676,34 @@ mod tests {
         assert_eq!(style.effective_font_size(), 20.0);
         let size = FixedWidthTextMeasure.measure_styled("ab", &style, 800.0);
         assert!((size.height - 24.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_text_flows_around_float() {
+        use crate::layout::compute_layout;
+        use crate::style::Float;
+        use crate::values::LengthPercentageAuto;
+        let mut builder = BoxTreeBuilder::new();
+        let root = builder.root(ComputedStyle::block());
+        let mut float_style = ComputedStyle::block();
+        float_style.float = Float::Right;
+        float_style.width = LengthPercentageAuto::px(100.0);
+        float_style.height = LengthPercentageAuto::px(30.0);
+        let fl = builder.element(root, float_style);
+        let mut para_style = ComputedStyle::block();
+        para_style.line_height = 10.0;
+        let para = builder.element(root, para_style);
+        for _ in 0..20 {
+            builder.text(para, "word");
+        }
+        let tree = builder.build();
+        let result = compute_layout(&tree, &FixedWidthTextMeasure, Size::new(200.0, 600.0));
+        assert_eq!(result.bounding_rect(fl).unwrap().x, 100.0);
+        let p = result.find_fragment(para).unwrap();
+        // Lines beside the 30px float are 100px wide; later lines use 200px.
+        assert!(p.children[0].size.width <= 100.0);
+        let last = p.children.last().unwrap();
+        assert!(last.position.y >= 30.0);
+        assert_eq!(last.size.width, 200.0);
     }
 }

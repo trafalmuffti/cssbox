@@ -3,10 +3,11 @@
 use crate::block;
 use crate::flex;
 use crate::fragment::{Fragment, FragmentKind, LayoutResult};
-use crate::geometry::Size;
+use crate::geometry::{Rect, Size};
 use crate::grid;
 use crate::position;
 use crate::style::ComputedStyle;
+use crate::style::Float;
 use crate::table;
 use crate::tree::{BoxTree, FormattingContextType, NodeId};
 
@@ -78,11 +79,61 @@ impl TextMeasure for FixedWidthTextMeasure {
     }
 }
 
+/// Float exclusions in some box's coordinate space.
+pub(crate) type FloatList = Vec<(Rect, Float)>;
+
 /// Layout context passed through the layout tree.
 pub struct LayoutContext<'a> {
     pub tree: &'a BoxTree,
     pub text_measure: &'a dyn TextMeasure,
     pub viewport: Size,
+    /// Border-box heights imposed on boxes by their flex container (stretched
+    /// cross size, or resolved main size in a column). Consumed when the box
+    /// is laid out.
+    forced_heights: core::cell::RefCell<Vec<(NodeId, f32)>>,
+    /// Float exclusions handed from a block to a child that shares its
+    /// block formatting context, in the child's content-box coordinates.
+    inherited_floats: core::cell::RefCell<Vec<(NodeId, FloatList)>>,
+}
+
+impl<'a> LayoutContext<'a> {
+    pub fn new(tree: &'a BoxTree, text_measure: &'a dyn TextMeasure, viewport: Size) -> Self {
+        Self {
+            tree,
+            text_measure,
+            viewport,
+            forced_heights: core::cell::RefCell::new(Vec::new()),
+            inherited_floats: core::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn pass_floats(&self, node: NodeId, floats: FloatList) {
+        let mut v = self.inherited_floats.borrow_mut();
+        v.retain(|(n, _)| *n != node);
+        v.push((node, floats));
+    }
+
+    pub(crate) fn take_floats(&self, node: NodeId) -> FloatList {
+        let mut v = self.inherited_floats.borrow_mut();
+        match v.iter().position(|(n, _)| *n == node) {
+            Some(i) => v.swap_remove(i).1,
+            None => Vec::new(),
+        }
+    }
+
+    /// Impose a border-box height on `node` for its next layout.
+    pub(crate) fn force_height(&self, node: NodeId, height: f32) {
+        let mut v = self.forced_heights.borrow_mut();
+        v.retain(|(n, _)| *n != node);
+        v.push((node, height.max(0.0)));
+    }
+
+    /// Take (and clear) the height imposed on `node`, if any.
+    pub(crate) fn take_forced_height(&self, node: NodeId) -> Option<f32> {
+        let mut v = self.forced_heights.borrow_mut();
+        let pos = v.iter().position(|(n, _)| *n == node)?;
+        Some(v.swap_remove(pos).1)
+    }
 }
 
 /// Compute layout for an entire box tree.
@@ -91,11 +142,7 @@ pub fn compute_layout(
     text_measure: &dyn TextMeasure,
     viewport: Size,
 ) -> LayoutResult {
-    let ctx = LayoutContext {
-        tree,
-        text_measure,
-        viewport,
-    };
+    let ctx = LayoutContext::new(tree, text_measure, viewport);
 
     let root = tree.root();
     let root_fragment = layout_node(&ctx, root, viewport.width, viewport.height);
