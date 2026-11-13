@@ -228,7 +228,9 @@ fn compute_intrinsic_width(ctx: &LayoutContext, node: NodeId, available: f32) ->
         }
 
         if let Some(text) = ctx.tree.node(child_id).text_content() {
-            let size = ctx.text_measure.measure(text, 16.0, available);
+            let size = ctx
+                .text_measure
+                .measure_styled(text, child_style, available);
             max_child_width = max_child_width.max(size.width);
         } else if child_style.display.is_block_level() {
             let child_width = if let Some(w) = child_style.width.resolve(available) {

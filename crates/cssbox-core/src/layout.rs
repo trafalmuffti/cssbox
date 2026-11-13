@@ -6,6 +6,7 @@ use crate::fragment::{Fragment, FragmentKind, LayoutResult};
 use crate::geometry::Size;
 use crate::grid;
 use crate::position;
+use crate::style::ComputedStyle;
 use crate::table;
 use crate::tree::{BoxTree, FormattingContextType, NodeId};
 
@@ -13,6 +14,15 @@ use crate::tree::{BoxTree, FormattingContextType, NodeId};
 pub trait TextMeasure {
     /// Measure the width and height of a text string within a maximum width.
     fn measure(&self, text: &str, font_size: f32, max_width: f32) -> Size;
+
+    /// Measure text using the full computed style of the text node.
+    ///
+    /// Embedders that need more than a font size (family, weight, letter
+    /// spacing, ...) can override this and read [`ComputedStyle::font_id`].
+    /// The default implementation forwards to [`TextMeasure::measure`].
+    fn measure_styled(&self, text: &str, style: &ComputedStyle, max_width: f32) -> Size {
+        self.measure(text, style.effective_font_size(), max_width)
+    }
 }
 
 /// A fixed-width text measurer for testing (every character = 8px wide).
@@ -144,8 +154,7 @@ pub fn layout_node(
 /// Layout a text node.
 fn layout_text(ctx: &LayoutContext, node: NodeId, text: &str, max_width: f32) -> Fragment {
     let style = ctx.tree.style(node);
-    let font_size = style.line_height / 1.2; // approximate
-    let size = ctx.text_measure.measure(text, font_size, max_width);
+    let size = ctx.text_measure.measure_styled(text, style, max_width);
 
     let mut fragment = Fragment::new(node, FragmentKind::TextRun);
     fragment.size = size;

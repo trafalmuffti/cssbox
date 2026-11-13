@@ -3,19 +3,34 @@
 //! This module handles the layout of inline-level content, including text runs,
 //! inline boxes, and line breaking.
 
+use crate::box_model::BoxModel;
 use crate::float::FloatContext;
 use crate::fragment::{Fragment, FragmentKind};
-use crate::geometry::{Point, Size};
+use crate::geometry::{Edges, Point, Size};
 use crate::layout::LayoutContext;
-use crate::style::{TextAlign, VerticalAlign, WhiteSpace};
+use crate::style::{BoxSizing, TextAlign, VerticalAlign, WhiteSpace};
 use crate::tree::NodeId;
 
 /// An inline item that needs to be laid out within a line.
 #[derive(Debug, Clone)]
 struct InlineItem {
     node: NodeId,
+    /// Outer size used for line breaking (margin box for atomic inlines).
     size: Size,
     baseline: f32,
+    /// Atomic inline-level box (replaced element or explicitly sized box).
+    atomic: Option<AtomicBox>,
+    /// A forced line break (a text node consisting of exactly `"\n"`).
+    forced_break: bool,
+}
+
+/// Resolved box model of an atomic inline box.
+#[derive(Debug, Clone, Copy)]
+struct AtomicBox {
+    content: Size,
+    margin: Edges,
+    border: Edges,
+    padding: Edges,
 }
 
 /// A single line box containing inline items.
@@ -25,6 +40,7 @@ struct LineBox {
     width: f32,
     height: f32,
     baseline: f32,
+    descent: f32,
 }
 
 impl LineBox {
@@ -34,13 +50,20 @@ impl LineBox {
             width: 0.0,
             height: 0.0,
             baseline: 0.0,
+            descent: 0.0,
         }
     }
 
     fn add_item(&mut self, item: InlineItem) {
         self.width += item.size.width;
-        self.height = self.height.max(item.size.height);
         self.baseline = self.baseline.max(item.baseline);
+        self.descent = self.descent.max(item.size.height - item.baseline);
+        // Items are baseline-aligned, so the line must fit the tallest ascent
+        // plus the deepest descent, not merely the tallest item.
+        self.height = self
+            .height
+            .max(item.size.height)
+            .max(self.baseline + self.descent);
         self.items.push(item);
     }
 
@@ -58,13 +81,10 @@ impl LineBox {
 /// This function creates line boxes from inline-level children of the parent node,
 /// applying line breaking, text alignment, and vertical alignment.
 ///
-/// # Arguments
-///
-/// * `ctx` - The layout context with tree and text measurement
-/// * `parent` - The parent node establishing the inline formatting context
-/// * `containing_width` - The available width for lines
-/// * `fragments` - Output vector to append generated fragments
-/// * `float_ctx` - Float context for handling floated elements (currently unused)
+/// Text nodes are treated as unbreakable runs; embedders wanting word-level
+/// wrapping should split text into one node per word. A text node whose
+/// content is exactly `"\n"` forces a line break. Inline elements with a
+/// resolvable `width` and `height` are laid out as atomic inline boxes.
 ///
 /// # Returns
 ///
@@ -96,9 +116,15 @@ pub fn layout_inline_formatting_context(
 
     // Position line boxes and create fragments
     let mut current_y = 0.0;
+    let line_count = line_boxes.len();
 
-    for line_box in &line_boxes {
+    for (line_idx, line_box) in line_boxes.iter().enumerate() {
         let line_height_actual = line_box.height.max(line_height);
+        // Extra leading is split evenly above and below the content.
+        let half_leading = ((line_height_actual - line_box.height) / 2.0).max(0.0);
+        let ends_paragraph =
+            line_idx + 1 == line_count || line_box.items.last().is_some_and(|i| i.forced_break);
+        let justify = text_align == TextAlign::Justify && !ends_paragraph;
 
         // Apply text alignment
         let line_offset_x = calculate_text_align_offset(
@@ -115,31 +141,47 @@ pub fn layout_inline_formatting_context(
 
         // Position items within line
         let mut current_x = line_offset_x;
+        let gap_count = line_box.items.iter().filter(|i| !i.forced_break).count();
 
         for (idx, item) in line_box.items.iter().enumerate() {
-            let mut item_fragment = Fragment::new(item.node, FragmentKind::TextRun);
-            item_fragment.size = item.size;
-
-            // Calculate vertical position based on vertical-align
+            if item.forced_break {
+                continue;
+            }
             let item_style = ctx.tree.style(item.node);
-            let vertical_offset = calculate_vertical_align_offset(
-                item_style.vertical_align,
-                line_box.baseline,
-                item.baseline,
-                item.size.height,
-                line_height_actual,
-            );
+            let vertical_offset = half_leading
+                + calculate_vertical_align_offset(
+                    item_style.vertical_align,
+                    line_box.baseline,
+                    item.baseline,
+                    item.size.height,
+                    line_box.height,
+                );
 
-            item_fragment.position = Point::new(current_x, vertical_offset);
+            let item_fragment = match item.atomic {
+                Some(atomic) => {
+                    let mut f = Fragment::new(item.node, FragmentKind::Box);
+                    f.size = atomic.content;
+                    f.margin = atomic.margin;
+                    f.border = atomic.border;
+                    f.padding = atomic.padding;
+                    f.position = Point::new(
+                        current_x + atomic.margin.left,
+                        vertical_offset + atomic.margin.top,
+                    );
+                    f
+                }
+                None => {
+                    let mut f = Fragment::new(item.node, FragmentKind::TextRun);
+                    f.size = item.size;
+                    f.position = Point::new(current_x, vertical_offset);
+                    f
+                }
+            };
 
             // Apply justify spacing if needed
-            let extra_space = if text_align == TextAlign::Justify
-                && line_box.items.len() > 1
-                && idx < line_box.items.len() - 1
-            {
-                let remaining = containing_width - line_box.used_width();
-                let gaps = (line_box.items.len() - 1) as f32;
-                remaining / gaps
+            let extra_space = if justify && gap_count > 1 && idx + 1 < gap_count {
+                let remaining = (containing_width - line_box.used_width()).max(0.0);
+                remaining / (gap_count - 1) as f32
             } else {
                 0.0
             };
@@ -169,11 +211,25 @@ fn collect_inline_items(
         let node = ctx.tree.node(child);
         let style = ctx.tree.style(child);
 
+        if style.display.is_none() {
+            continue;
+        }
+
         if node.is_text() {
             if let Some(text) = node.text_content() {
-                // Measure text
-                let font_size = style.line_height / 1.2;
-                let size = ctx.text_measure.measure(text, font_size, max_width);
+                if text == "\n" {
+                    let size = ctx.text_measure.measure_styled("", style, max_width);
+                    items.push(InlineItem {
+                        node: child,
+                        size: Size::new(0.0, size.height),
+                        baseline: size.height * 0.8,
+                        atomic: None,
+                        forced_break: true,
+                    });
+                    continue;
+                }
+
+                let size = ctx.text_measure.measure_styled(text, style, max_width);
 
                 // For text, baseline is typically at bottom minus descent
                 // Simplified: baseline is at 80% of height (20% descent)
@@ -183,20 +239,56 @@ fn collect_inline_items(
                     node: child,
                     size,
                     baseline,
+                    atomic: None,
+                    forced_break: false,
                 });
             }
+        } else if let (Some(w), Some(h)) = (
+            style.width.resolve(max_width),
+            style.height.resolve(ctx.viewport.height),
+        ) {
+            // Atomic inline box with an explicit size (images, form controls,
+            // explicitly sized inline-blocks).
+            let border = BoxModel::resolve_border(style);
+            let padding = BoxModel::resolve_padding(style, max_width);
+            let margin = BoxModel::resolve_margin(style, max_width);
+            let (cw, ch) = if style.box_sizing == BoxSizing::BorderBox {
+                (
+                    (w - border.horizontal() - padding.horizontal()).max(0.0),
+                    (h - border.vertical() - padding.vertical()).max(0.0),
+                )
+            } else {
+                (w, h)
+            };
+            let outer = Size::new(
+                cw + padding.horizontal() + border.horizontal() + margin.horizontal(),
+                ch + padding.vertical() + border.vertical() + margin.vertical(),
+            );
+            items.push(InlineItem {
+                node: child,
+                size: outer,
+                // Atomic inlines sit on the baseline with their bottom margin edge.
+                baseline: outer.height,
+                atomic: Some(AtomicBox {
+                    content: Size::new(cw, ch),
+                    margin,
+                    border,
+                    padding,
+                }),
+                forced_break: false,
+            });
         } else {
-            // Inline-level element - recursively collect or measure as atomic
-            // For now, treat as atomic inline-block
-            // In a full implementation, we'd check display type and recurse if inline
-            let font_size = style.line_height / 1.2;
-            let size = ctx.text_measure.measure("X", font_size, max_width);
+            // Inline-level element without an explicit size: approximate it
+            // as a single glyph-sized box.
+            let size = ctx.text_measure.measure_styled("X", style, max_width);
             let baseline = size.height * 0.8;
 
             items.push(InlineItem {
                 node: child,
                 size,
                 baseline,
+                atomic: None,
+                forced_break: false,
             });
         }
     }
@@ -217,6 +309,11 @@ fn break_into_lines(
     let mut current_line = LineBox::new();
 
     for item in items {
+        if item.forced_break {
+            current_line.add_item(item.clone());
+            line_boxes.push(std::mem::replace(&mut current_line, LineBox::new()));
+            continue;
+        }
         let item_width = item.size.width;
 
         // Check if item fits on current line
@@ -280,7 +377,7 @@ fn calculate_vertical_align_offset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::FixedWidthTextMeasure;
+    use crate::layout::{FixedWidthTextMeasure, TextMeasure};
     use crate::style::ComputedStyle;
     use crate::tree::{BoxTreeBuilder, NodeKind, TextContent};
 
@@ -396,6 +493,8 @@ mod tests {
         let root = builder.root(style);
         builder.text(root, "A");
         builder.text(root, "B");
+        // Forces a wrap: the first line is justified, the last line is not.
+        builder.text(root, "CCCCCCCCCCCC");
         let tree = builder.build();
 
         let ctx = LayoutContext {
@@ -408,6 +507,8 @@ mod tests {
         let mut float_ctx = FloatContext::new(100.0);
         layout_inline_formatting_context(&ctx, root, 100.0, &mut fragments, &mut float_ctx);
 
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[1].children[0].position.x, 0.0);
         let line = &fragments[0];
         assert_eq!(line.children.len(), 2);
 
@@ -530,5 +631,74 @@ mod tests {
         // Should be one line despite narrow width
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].children.len(), 3);
+    }
+
+    #[test]
+    fn test_forced_line_break() {
+        let mut builder = BoxTreeBuilder::new();
+        let root = builder.root(ComputedStyle::block());
+        builder.text(root, "A");
+        builder.text(root, "\n");
+        builder.text(root, "\n");
+        builder.text(root, "B");
+        let tree = builder.build();
+
+        let ctx = LayoutContext {
+            tree: &tree,
+            text_measure: &FixedWidthTextMeasure,
+            viewport: Size::new(800.0, 600.0),
+        };
+
+        let mut fragments = Vec::new();
+        let mut float_ctx = FloatContext::new(800.0);
+        layout_inline_formatting_context(&ctx, root, 800.0, &mut fragments, &mut float_ctx);
+
+        // "A", an empty line, then "B".
+        assert_eq!(fragments.len(), 3);
+        assert_eq!(fragments[1].children.len(), 0);
+        assert!(fragments[2].position.y > fragments[1].position.y);
+    }
+
+    #[test]
+    fn test_atomic_inline_box() {
+        use crate::values::LengthPercentageAuto;
+        let mut builder = BoxTreeBuilder::new();
+        let root = builder.root(ComputedStyle::block());
+        builder.text(root, "Hi");
+        let mut img = ComputedStyle::inline();
+        img.width = LengthPercentageAuto::px(40.0);
+        img.height = LengthPercentageAuto::px(30.0);
+        let img_id = builder.element(root, img);
+        let tree = builder.build();
+
+        let ctx = LayoutContext {
+            tree: &tree,
+            text_measure: &FixedWidthTextMeasure,
+            viewport: Size::new(800.0, 600.0),
+        };
+
+        let mut fragments = Vec::new();
+        let mut float_ctx = FloatContext::new(800.0);
+        let height =
+            layout_inline_formatting_context(&ctx, root, 800.0, &mut fragments, &mut float_ctx);
+
+        let line = &fragments[0];
+        let atomic = line.children.iter().find(|f| f.node == img_id).unwrap();
+        assert_eq!(atomic.kind, FragmentKind::Box);
+        assert_eq!(atomic.size, Size::new(40.0, 30.0));
+        assert_eq!(atomic.position.x, 16.0);
+        // Line must hold the 30px box plus the text's descent below the baseline.
+        assert!(height >= 30.0);
+        let text = &line.children[0];
+        assert!(text.position.y + text.size.height <= height + 0.01);
+    }
+
+    #[test]
+    fn test_measure_styled_uses_font_size() {
+        let mut style = ComputedStyle::inline();
+        style.font_size = 20.0;
+        assert_eq!(style.effective_font_size(), 20.0);
+        let size = FixedWidthTextMeasure.measure_styled("ab", &style, 800.0);
+        assert!((size.height - 24.0).abs() < 0.01);
     }
 }
