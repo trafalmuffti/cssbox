@@ -144,7 +144,12 @@ impl BoxTree {
             DisplayInner::Flex => FormattingContextType::Flex,
             DisplayInner::Grid => FormattingContextType::Grid,
             DisplayInner::Table => FormattingContextType::Table,
-            DisplayInner::Flow | DisplayInner::FlowRoot => {
+            // Table cells and captions are block containers too: their
+            // content flows inline unless it contains blocks.
+            DisplayInner::Flow
+            | DisplayInner::FlowRoot
+            | DisplayInner::TableCell
+            | DisplayInner::TableCaption => {
                 // Determine if children are all block or all inline
                 let children = self.children(id);
                 if children.is_empty() {
