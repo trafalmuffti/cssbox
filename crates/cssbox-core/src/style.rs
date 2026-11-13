@@ -500,6 +500,11 @@ pub struct ComputedStyle {
     pub vertical_align: VerticalAlign,
     pub line_height: f32,
     pub white_space: WhiteSpace,
+    /// Font size in px. `0.0` means "derive from `line_height`" (legacy behaviour).
+    pub font_size: f32,
+    /// Opaque font handle chosen by the embedder (family/weight/style/etc.).
+    /// Passed through to [`crate::layout::TextMeasure::measure_styled`].
+    pub font_id: u32,
 
     // Flexbox
     pub flex_direction: FlexDirection,
@@ -581,6 +586,8 @@ impl Default for ComputedStyle {
             vertical_align: VerticalAlign::Baseline,
             line_height: 1.2,
             white_space: WhiteSpace::Normal,
+            font_size: 0.0,
+            font_id: 0,
 
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::Nowrap,
@@ -637,6 +644,16 @@ impl ComputedStyle {
             || self.overflow_y != Overflow::Visible
             || self.float != Float::None
             || self.position.is_absolutely_positioned()
+    }
+
+    /// Font size used for text measurement: `font_size` if set, otherwise
+    /// derived from `line_height`.
+    pub fn effective_font_size(&self) -> f32 {
+        if self.font_size > 0.0 {
+            self.font_size
+        } else {
+            self.line_height / 1.2
+        }
     }
 
     /// Whether this element is out of flow.

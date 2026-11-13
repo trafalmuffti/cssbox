@@ -3,19 +3,34 @@
 //! This module handles the layout of inline-level content, including text runs,
 //! inline boxes, and line breaking.
 
+use crate::box_model::BoxModel;
 use crate::float::FloatContext;
 use crate::fragment::{Fragment, FragmentKind};
-use crate::geometry::{Point, Size};
+use crate::geometry::{Edges, Point, Size};
 use crate::layout::LayoutContext;
-use crate::style::{TextAlign, VerticalAlign, WhiteSpace};
+use crate::style::{BoxSizing, TextAlign, VerticalAlign, WhiteSpace};
 use crate::tree::NodeId;
 
 /// An inline item that needs to be laid out within a line.
 #[derive(Debug, Clone)]
 struct InlineItem {
     node: NodeId,
+    /// Outer size used for line breaking (margin box for atomic inlines).
     size: Size,
     baseline: f32,
+    /// Atomic inline-level box (replaced element or explicitly sized box).
+    atomic: Option<AtomicBox>,
+    /// A forced line break (a text node consisting of exactly `"\n"`).
+    forced_break: bool,
+}
+
+/// Resolved box model of an atomic inline box.
+#[derive(Debug, Clone, Copy)]
+struct AtomicBox {
+    content: Size,
+    margin: Edges,
+    border: Edges,
+    padding: Edges,
 }
 
 /// A single line box containing inline items.
@@ -25,6 +40,7 @@ struct LineBox {
     width: f32,
     height: f32,
     baseline: f32,
+    descent: f32,
 }
 
 impl LineBox {
@@ -34,13 +50,20 @@ impl LineBox {
             width: 0.0,
             height: 0.0,
             baseline: 0.0,
+            descent: 0.0,
         }
     }
 
     fn add_item(&mut self, item: InlineItem) {
         self.width += item.size.width;
-        self.height = self.height.max(item.size.height);
         self.baseline = self.baseline.max(item.baseline);
+        self.descent = self.descent.max(item.size.height - item.baseline);
+        // Items are baseline-aligned, so the line must fit the tallest ascent
+        // plus the deepest descent, not merely the tallest item.
+        self.height = self
+            .height
+            .max(item.size.height)
+            .max(self.baseline + self.descent);
         self.items.push(item);
     }
 
@@ -58,13 +81,10 @@ impl LineBox {
 /// This function creates line boxes from inline-level children of the parent node,
 /// applying line breaking, text alignment, and vertical alignment.
 ///
-/// # Arguments
-///
-/// * `ctx` - The layout context with tree and text measurement
-/// * `parent` - The parent node establishing the inline formatting context
-/// * `containing_width` - The available width for lines
-/// * `fragments` - Output vector to append generated fragments
-/// * `float_ctx` - Float context for handling floated elements (currently unused)
+/// Text nodes are treated as unbreakable runs; embedders wanting word-level
+/// wrapping should split text into one node per word. A text node whose
+/// content is exactly `"\n"` forces a line break. Inline elements with a
+/// resolvable `width` and `height` are laid out as atomic inline boxes.
 ///
 /// # Returns
 ///
@@ -74,7 +94,7 @@ pub fn layout_inline_formatting_context(
     parent: NodeId,
     containing_width: f32,
     fragments: &mut Vec<Fragment>,
-    _float_ctx: &mut FloatContext,
+    float_ctx: &mut FloatContext,
 ) -> f32 {
     let parent_style = ctx.tree.style(parent);
     let text_align = parent_style.text_align;
@@ -85,20 +105,27 @@ pub fn layout_inline_formatting_context(
     let mut inline_items = Vec::new();
     collect_inline_items(ctx, parent, containing_width, &mut inline_items);
 
-    // Break into line boxes
-    let mut line_boxes = Vec::new();
-    break_into_lines(
+    // Break into line boxes, narrowing each line by any floats beside it.
+    let line_boxes = flow_lines(
         &inline_items,
         containing_width,
+        line_height,
         white_space,
-        &mut line_boxes,
+        float_ctx,
     );
 
     // Position line boxes and create fragments
-    let mut current_y = 0.0;
+    let line_count = line_boxes.len();
 
-    for line_box in &line_boxes {
+    for (line_idx, (line_box, line_y, line_left, line_width)) in line_boxes.iter().enumerate() {
+        let current_y = *line_y;
+        let containing_width = *line_width;
         let line_height_actual = line_box.height.max(line_height);
+        // Extra leading is split evenly above and below the content.
+        let half_leading = ((line_height_actual - line_box.height) / 2.0).max(0.0);
+        let ends_paragraph =
+            line_idx + 1 == line_count || line_box.items.last().is_some_and(|i| i.forced_break);
+        let justify = text_align == TextAlign::Justify && !ends_paragraph;
 
         // Apply text alignment
         let line_offset_x = calculate_text_align_offset(
@@ -110,36 +137,52 @@ pub fn layout_inline_formatting_context(
 
         // Create line box fragment
         let mut line_fragment = Fragment::new(parent, FragmentKind::LineBox);
-        line_fragment.position = Point::new(0.0, current_y);
+        line_fragment.position = Point::new(*line_left, current_y);
         line_fragment.size = Size::new(containing_width, line_height_actual);
 
         // Position items within line
         let mut current_x = line_offset_x;
+        let gap_count = line_box.items.iter().filter(|i| !i.forced_break).count();
 
         for (idx, item) in line_box.items.iter().enumerate() {
-            let mut item_fragment = Fragment::new(item.node, FragmentKind::TextRun);
-            item_fragment.size = item.size;
-
-            // Calculate vertical position based on vertical-align
+            if item.forced_break {
+                continue;
+            }
             let item_style = ctx.tree.style(item.node);
-            let vertical_offset = calculate_vertical_align_offset(
-                item_style.vertical_align,
-                line_box.baseline,
-                item.baseline,
-                item.size.height,
-                line_height_actual,
-            );
+            let vertical_offset = half_leading
+                + calculate_vertical_align_offset(
+                    item_style.vertical_align,
+                    line_box.baseline,
+                    item.baseline,
+                    item.size.height,
+                    line_box.height,
+                );
 
-            item_fragment.position = Point::new(current_x, vertical_offset);
+            let item_fragment = match item.atomic {
+                Some(atomic) => {
+                    let mut f = Fragment::new(item.node, FragmentKind::Box);
+                    f.size = atomic.content;
+                    f.margin = atomic.margin;
+                    f.border = atomic.border;
+                    f.padding = atomic.padding;
+                    f.position = Point::new(
+                        current_x + atomic.margin.left,
+                        vertical_offset + atomic.margin.top,
+                    );
+                    f
+                }
+                None => {
+                    let mut f = Fragment::new(item.node, FragmentKind::TextRun);
+                    f.size = item.size;
+                    f.position = Point::new(current_x, vertical_offset);
+                    f
+                }
+            };
 
             // Apply justify spacing if needed
-            let extra_space = if text_align == TextAlign::Justify
-                && line_box.items.len() > 1
-                && idx < line_box.items.len() - 1
-            {
-                let remaining = containing_width - line_box.used_width();
-                let gaps = (line_box.items.len() - 1) as f32;
-                remaining / gaps
+            let extra_space = if justify && gap_count > 1 && idx + 1 < gap_count {
+                let remaining = (containing_width - line_box.used_width()).max(0.0);
+                remaining / (gap_count - 1) as f32
             } else {
                 0.0
             };
@@ -149,11 +192,75 @@ pub fn layout_inline_formatting_context(
             line_fragment.children.push(item_fragment);
         }
 
-        current_y += line_height_actual;
         fragments.push(line_fragment);
     }
 
-    current_y
+    line_boxes
+        .last()
+        .map(|(lb, y, _, _)| y + lb.height.max(line_height))
+        .unwrap_or(0.0)
+}
+
+/// Greedy line breaking where each line's available width can be reduced by
+/// floats. Returns (line, y, left offset, available width) per line.
+fn flow_lines(
+    items: &[InlineItem],
+    containing_width: f32,
+    line_height: f32,
+    white_space: WhiteSpace,
+    float_ctx: &FloatContext,
+) -> Vec<(LineBox, f32, f32, f32)> {
+    let mut out = Vec::new();
+    if items.is_empty() {
+        return out;
+    }
+    let allow_wrapping = white_space.wraps();
+    let floats = float_ctx.has_floats();
+    let mut y = 0.0f32;
+    let mut idx = 0;
+    while idx < items.len() {
+        let probe = line_height.max(1.0);
+        let (mut left, mut avail) = if floats {
+            float_ctx.available_width_at(y, probe)
+        } else {
+            (0.0, containing_width)
+        };
+        // If the next item cannot fit beside the floats, move below them.
+        if floats && allow_wrapping {
+            let first_w = items[idx].size.width;
+            let mut guard = 0;
+            while first_w > avail && avail < containing_width - 0.5 && guard < 64 {
+                let ny = float_ctx.next_y_after(y, probe);
+                if ny <= y {
+                    break;
+                }
+                y = ny;
+                let a = float_ctx.available_width_at(y, probe);
+                left = a.0;
+                avail = a.1;
+                guard += 1;
+            }
+        }
+        let mut line = LineBox::new();
+        while idx < items.len() {
+            let item = &items[idx];
+            if item.forced_break {
+                line.add_item(item.clone());
+                idx += 1;
+                break;
+            }
+            if line.is_empty() || !allow_wrapping || line.used_width() + item.size.width <= avail {
+                line.add_item(item.clone());
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+        let h = line.height.max(line_height);
+        out.push((line, y, left, avail));
+        y += h;
+    }
+    out
 }
 
 /// Collect inline items from the children of a parent node.
@@ -169,11 +276,25 @@ fn collect_inline_items(
         let node = ctx.tree.node(child);
         let style = ctx.tree.style(child);
 
+        if style.display.is_none() {
+            continue;
+        }
+
         if node.is_text() {
             if let Some(text) = node.text_content() {
-                // Measure text
-                let font_size = style.line_height / 1.2;
-                let size = ctx.text_measure.measure(text, font_size, max_width);
+                if text == "\n" {
+                    let size = ctx.text_measure.measure_styled("", style, max_width);
+                    items.push(InlineItem {
+                        node: child,
+                        size: Size::new(0.0, size.height),
+                        baseline: size.height * 0.8,
+                        atomic: None,
+                        forced_break: true,
+                    });
+                    continue;
+                }
+
+                let size = ctx.text_measure.measure_styled(text, style, max_width);
 
                 // For text, baseline is typically at bottom minus descent
                 // Simplified: baseline is at 80% of height (20% descent)
@@ -183,62 +304,58 @@ fn collect_inline_items(
                     node: child,
                     size,
                     baseline,
+                    atomic: None,
+                    forced_break: false,
                 });
             }
+        } else if let (Some(w), Some(h)) = (
+            style.width.resolve(max_width),
+            style.height.resolve(ctx.viewport.height),
+        ) {
+            // Atomic inline box with an explicit size (images, form controls,
+            // explicitly sized inline-blocks).
+            let border = BoxModel::resolve_border(style);
+            let padding = BoxModel::resolve_padding(style, max_width);
+            let margin = BoxModel::resolve_margin(style, max_width);
+            let (cw, ch) = if style.box_sizing == BoxSizing::BorderBox {
+                (
+                    (w - border.horizontal() - padding.horizontal()).max(0.0),
+                    (h - border.vertical() - padding.vertical()).max(0.0),
+                )
+            } else {
+                (w, h)
+            };
+            let outer = Size::new(
+                cw + padding.horizontal() + border.horizontal() + margin.horizontal(),
+                ch + padding.vertical() + border.vertical() + margin.vertical(),
+            );
+            items.push(InlineItem {
+                node: child,
+                size: outer,
+                // Atomic inlines sit on the baseline with their bottom margin edge.
+                baseline: outer.height,
+                atomic: Some(AtomicBox {
+                    content: Size::new(cw, ch),
+                    margin,
+                    border,
+                    padding,
+                }),
+                forced_break: false,
+            });
         } else {
-            // Inline-level element - recursively collect or measure as atomic
-            // For now, treat as atomic inline-block
-            // In a full implementation, we'd check display type and recurse if inline
-            let font_size = style.line_height / 1.2;
-            let size = ctx.text_measure.measure("X", font_size, max_width);
+            // Inline-level element without an explicit size: approximate it
+            // as a single glyph-sized box.
+            let size = ctx.text_measure.measure_styled("X", style, max_width);
             let baseline = size.height * 0.8;
 
             items.push(InlineItem {
                 node: child,
                 size,
                 baseline,
+                atomic: None,
+                forced_break: false,
             });
         }
-    }
-}
-
-/// Break inline items into line boxes using greedy line breaking.
-fn break_into_lines(
-    items: &[InlineItem],
-    containing_width: f32,
-    white_space: WhiteSpace,
-    line_boxes: &mut Vec<LineBox>,
-) {
-    if items.is_empty() {
-        return;
-    }
-
-    let allow_wrapping = white_space.wraps();
-    let mut current_line = LineBox::new();
-
-    for item in items {
-        let item_width = item.size.width;
-
-        // Check if item fits on current line
-        let fits =
-            current_line.is_empty() || current_line.used_width() + item_width <= containing_width;
-
-        if fits || !allow_wrapping {
-            // Add to current line
-            current_line.add_item(item.clone());
-        } else {
-            // Start new line
-            if !current_line.is_empty() {
-                line_boxes.push(current_line);
-            }
-            current_line = LineBox::new();
-            current_line.add_item(item.clone());
-        }
-    }
-
-    // Push final line
-    if !current_line.is_empty() {
-        line_boxes.push(current_line);
     }
 }
 
@@ -280,7 +397,7 @@ fn calculate_vertical_align_offset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::FixedWidthTextMeasure;
+    use crate::layout::{FixedWidthTextMeasure, TextMeasure};
     use crate::style::ComputedStyle;
     use crate::tree::{BoxTreeBuilder, NodeKind, TextContent};
 
@@ -291,11 +408,7 @@ mod tests {
         builder.text(root, "Hello");
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(800.0);
@@ -317,11 +430,7 @@ mod tests {
         builder.text(root, "Test");
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(50.0);
@@ -346,11 +455,7 @@ mod tests {
         builder.text(root, "Hi");
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(800.0);
@@ -372,11 +477,7 @@ mod tests {
         builder.text(root, "Hi");
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(800.0);
@@ -396,18 +497,18 @@ mod tests {
         let root = builder.root(style);
         builder.text(root, "A");
         builder.text(root, "B");
+        // Forces a wrap: the first line is justified, the last line is not.
+        builder.text(root, "CCCCCCCCCCCC");
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(100.0);
         layout_inline_formatting_context(&ctx, root, 100.0, &mut fragments, &mut float_ctx);
 
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[1].children[0].position.x, 0.0);
         let line = &fragments[0];
         assert_eq!(line.children.len(), 2);
 
@@ -428,11 +529,7 @@ mod tests {
         builder.text(root, "Test");
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(800.0);
@@ -466,11 +563,7 @@ mod tests {
 
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(800.0);
@@ -489,11 +582,7 @@ mod tests {
         let root = builder.root(ComputedStyle::block());
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(800.0);
@@ -515,11 +604,7 @@ mod tests {
         builder.text(root, "C");
         let tree = builder.build();
 
-        let ctx = LayoutContext {
-            tree: &tree,
-            text_measure: &FixedWidthTextMeasure,
-            viewport: Size::new(800.0, 600.0),
-        };
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let mut fragments = Vec::new();
         let mut float_ctx = FloatContext::new(10.0);
@@ -530,5 +615,95 @@ mod tests {
         // Should be one line despite narrow width
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].children.len(), 3);
+    }
+
+    #[test]
+    fn test_forced_line_break() {
+        let mut builder = BoxTreeBuilder::new();
+        let root = builder.root(ComputedStyle::block());
+        builder.text(root, "A");
+        builder.text(root, "\n");
+        builder.text(root, "\n");
+        builder.text(root, "B");
+        let tree = builder.build();
+
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
+
+        let mut fragments = Vec::new();
+        let mut float_ctx = FloatContext::new(800.0);
+        layout_inline_formatting_context(&ctx, root, 800.0, &mut fragments, &mut float_ctx);
+
+        // "A", an empty line, then "B".
+        assert_eq!(fragments.len(), 3);
+        assert_eq!(fragments[1].children.len(), 0);
+        assert!(fragments[2].position.y > fragments[1].position.y);
+    }
+
+    #[test]
+    fn test_atomic_inline_box() {
+        use crate::values::LengthPercentageAuto;
+        let mut builder = BoxTreeBuilder::new();
+        let root = builder.root(ComputedStyle::block());
+        builder.text(root, "Hi");
+        let mut img = ComputedStyle::inline();
+        img.width = LengthPercentageAuto::px(40.0);
+        img.height = LengthPercentageAuto::px(30.0);
+        let img_id = builder.element(root, img);
+        let tree = builder.build();
+
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
+
+        let mut fragments = Vec::new();
+        let mut float_ctx = FloatContext::new(800.0);
+        let height =
+            layout_inline_formatting_context(&ctx, root, 800.0, &mut fragments, &mut float_ctx);
+
+        let line = &fragments[0];
+        let atomic = line.children.iter().find(|f| f.node == img_id).unwrap();
+        assert_eq!(atomic.kind, FragmentKind::Box);
+        assert_eq!(atomic.size, Size::new(40.0, 30.0));
+        assert_eq!(atomic.position.x, 16.0);
+        // Line must hold the 30px box plus the text's descent below the baseline.
+        assert!(height >= 30.0);
+        let text = &line.children[0];
+        assert!(text.position.y + text.size.height <= height + 0.01);
+    }
+
+    #[test]
+    fn test_measure_styled_uses_font_size() {
+        let mut style = ComputedStyle::inline();
+        style.font_size = 20.0;
+        assert_eq!(style.effective_font_size(), 20.0);
+        let size = FixedWidthTextMeasure.measure_styled("ab", &style, 800.0);
+        assert!((size.height - 24.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_text_flows_around_float() {
+        use crate::layout::compute_layout;
+        use crate::style::Float;
+        use crate::values::LengthPercentageAuto;
+        let mut builder = BoxTreeBuilder::new();
+        let root = builder.root(ComputedStyle::block());
+        let mut float_style = ComputedStyle::block();
+        float_style.float = Float::Right;
+        float_style.width = LengthPercentageAuto::px(100.0);
+        float_style.height = LengthPercentageAuto::px(30.0);
+        let fl = builder.element(root, float_style);
+        let mut para_style = ComputedStyle::block();
+        para_style.line_height = 10.0;
+        let para = builder.element(root, para_style);
+        for _ in 0..20 {
+            builder.text(para, "word");
+        }
+        let tree = builder.build();
+        let result = compute_layout(&tree, &FixedWidthTextMeasure, Size::new(200.0, 600.0));
+        assert_eq!(result.bounding_rect(fl).unwrap().x, 100.0);
+        let p = result.find_fragment(para).unwrap();
+        // Lines beside the 30px float are 100px wide; later lines use 200px.
+        assert!(p.children[0].size.width <= 100.0);
+        let last = p.children.last().unwrap();
+        assert!(last.position.y >= 30.0);
+        assert_eq!(last.size.width, 200.0);
     }
 }

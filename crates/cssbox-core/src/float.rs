@@ -172,6 +172,45 @@ impl FloatContext {
         (left_edge, available)
     }
 
+    /// Whether any floats have been placed (or inherited).
+    pub fn has_floats(&self) -> bool {
+        !self.left_floats.is_empty() || !self.right_floats.is_empty()
+    }
+
+    /// Add an exclusion inherited from an ancestor's float context.
+    pub fn add_exclusion(&mut self, rect: Rect, side: Float) {
+        let fb = FloatBox { rect };
+        match side {
+            Float::Left => self.left_floats.push(fb),
+            Float::Right => self.right_floats.push(fb),
+            Float::None => {}
+        }
+    }
+
+    /// All floats translated into a child's coordinate space whose origin is
+    /// at (`dx`, `dy`) in this context.
+    pub fn exclusions_for_child(&self, dx: f32, dy: f32) -> Vec<(Rect, Float)> {
+        let mut out = Vec::new();
+        for f in &self.left_floats {
+            out.push((
+                Rect::new(f.rect.x - dx, f.rect.y - dy, f.rect.width, f.rect.height),
+                Float::Left,
+            ));
+        }
+        for f in &self.right_floats {
+            out.push((
+                Rect::new(f.rect.x - dx, f.rect.y - dy, f.rect.width, f.rect.height),
+                Float::Right,
+            ));
+        }
+        out
+    }
+
+    /// The next y below `y` at which the float configuration changes.
+    pub fn next_y_after(&self, y: f32, height: f32) -> f32 {
+        self.next_y_position(y, height)
+    }
+
     /// Get the y position that clears floats according to the clear property.
     ///
     /// # Arguments
