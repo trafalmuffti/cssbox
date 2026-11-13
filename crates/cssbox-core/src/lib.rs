@@ -32,6 +32,7 @@ pub mod fragment;
 pub mod geometry;
 pub mod grid;
 pub mod inline;
+pub mod intrinsic;
 pub mod layout;
 pub mod position;
 pub mod style;

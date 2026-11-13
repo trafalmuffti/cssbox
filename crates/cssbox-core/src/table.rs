@@ -9,6 +9,7 @@ use crate::geometry::{Point, Size};
 use crate::layout::{self, LayoutContext};
 use crate::style::*;
 use crate::tree::NodeId;
+use crate::values::LengthPercentageAuto;
 
 /// Layout a table element and its contents.
 pub fn layout_table(
@@ -29,19 +30,15 @@ pub fn layout_table(
     fragment.padding = padding;
     fragment.margin = margin;
 
-    let content_width = match style.width.resolve(containing_block_width) {
-        Some(mut w) => {
-            if style.box_sizing == BoxSizing::BorderBox {
-                w = (w - border.horizontal() - padding.horizontal()).max(0.0);
-            }
-            w
+    let explicit_width = style.width.resolve(containing_block_width).map(|mut w| {
+        if style.box_sizing == BoxSizing::BorderBox {
+            w = (w - border.horizontal() - padding.horizontal()).max(0.0);
         }
-        None => (containing_block_width
-            - border.horizontal()
-            - padding.horizontal()
-            - margin.horizontal())
-        .max(0.0),
-    };
+        w
+    });
+    let available_width =
+        (containing_block_width - border.horizontal() - padding.horizontal() - margin.horizontal())
+            .max(0.0);
 
     // Collect table structure
     let mut table = TableStructure::new();
@@ -57,14 +54,26 @@ pub fn layout_table(
 
     // Determine column widths
     let col_widths = if is_fixed {
-        fixed_table_layout(&table, content_width, border_spacing, ctx)
+        fixed_table_layout(
+            &table,
+            explicit_width.unwrap_or(available_width),
+            border_spacing,
+            ctx,
+        )
     } else {
-        auto_table_layout(&table, content_width, border_spacing, ctx)
+        auto_table_layout(&table, explicit_width, available_width, border_spacing, ctx)
     };
 
     let num_cols = col_widths.len();
     let total_spacing = border_spacing * (num_cols + 1) as f32;
     let table_content_width = col_widths.iter().sum::<f32>() + total_spacing;
+    // An auto-width table is as wide as its columns (shrink-to-fit); a
+    // fixed-layout table without a width fills the line, as before.
+    let content_width = match explicit_width {
+        Some(w) => w,
+        None if is_fixed => available_width,
+        None => table_content_width,
+    };
 
     // Layout captions (top)
     let mut cursor_y = 0.0f32;
@@ -114,10 +123,13 @@ pub fn layout_table(
             }
         }
 
-        // Position cells
+        // Position cells; every cell in a row is as tall as the row, so cell
+        // backgrounds and borders line up.
         for (col_idx, mut cell_frag) in cell_fragments {
             let x = col_position(&col_widths, col_idx, border_spacing);
             cell_frag.position = Point::new(x, cursor_y);
+            let extra = cell_frag.padding.vertical() + cell_frag.border.vertical();
+            cell_frag.size.height = cell_frag.size.height.max(row_height - extra);
 
             // Vertical alignment in cell — default to top
             // TODO: implement vertical-align for table cells
@@ -333,75 +345,139 @@ fn fixed_table_layout(
 
 // --- Auto table layout (CSS 2.1 §17.5.2.2) ---
 
+/// Per-column (min-content, max-content) widths and the border spacing.
+pub(crate) fn column_intrinsics(
+    ctx: &LayoutContext,
+    table_node: NodeId,
+) -> (Vec<f32>, Vec<f32>, f32) {
+    let style = ctx.tree.style(table_node);
+    let spacing = if style.border_collapse == BorderCollapse::Collapse {
+        0.0
+    } else {
+        style.border_spacing
+    };
+    let mut table = TableStructure::new();
+    collect_table_structure(ctx, table_node, &mut table);
+    let (mins, maxs, _) = column_widths(&table, ctx, f32::INFINITY);
+    (mins, maxs, spacing)
+}
+
+/// Column min/max widths from cell contents (CSS 2.1 §17.5.2.2), plus which
+/// columns have an explicit width.
+fn column_widths(
+    table: &TableStructure,
+    ctx: &LayoutContext,
+    available: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<bool>) {
+    let n = table.num_columns().max(1);
+    let mut mins = vec![0.0f32; n];
+    let mut maxs = vec![0.0f32; n];
+    let mut fixed = vec![false; n];
+    for row in &table.rows {
+        for cell in &row.cells {
+            if cell.col_start >= n {
+                continue;
+            }
+            let (mut mn, mut mx) = crate::intrinsic::intrinsic_widths(ctx, cell.node);
+            let cell_style = ctx.tree.style(cell.node);
+            if let LengthPercentageAuto::Percentage(p) = cell_style.width {
+                if available.is_finite() {
+                    let w = available * p;
+                    mx = mx.max(w);
+                    mn = mn.min(mx);
+                }
+            }
+            if matches!(cell_style.width, LengthPercentageAuto::Length(_)) {
+                fixed[cell.col_start] = true;
+            }
+            let span = cell.col_span.max(1).min(n - cell.col_start);
+            if span == 1 {
+                mins[cell.col_start] = mins[cell.col_start].max(mn);
+                maxs[cell.col_start] = maxs[cell.col_start].max(mx);
+            } else {
+                // Spread whatever the spanned columns lack evenly.
+                let cols = cell.col_start..cell.col_start + span;
+                let have_min: f32 = mins[cols.clone()].iter().sum();
+                let have_max: f32 = maxs[cols.clone()].iter().sum();
+                for c in cols {
+                    mins[c] += (mn - have_min).max(0.0) / span as f32;
+                    maxs[c] += (mx - have_max).max(0.0) / span as f32;
+                }
+            }
+        }
+    }
+    for (i, spec) in table.column_specs.iter().enumerate() {
+        if let (Some(w), true) = (spec.width, i < n) {
+            mins[i] = mins[i].max(w);
+            maxs[i] = maxs[i].max(w);
+            fixed[i] = true;
+        }
+    }
+    for i in 0..n {
+        maxs[i] = maxs[i].max(mins[i]);
+    }
+    (mins, maxs, fixed)
+}
+
+/// Automatic table layout: columns get their max-content width when it fits,
+/// their min-content width when even that does not, and in between
+/// proportionally otherwise. A table with an explicit width shares out any
+/// extra space among columns without an explicit width.
 fn auto_table_layout(
     table: &TableStructure,
-    table_width: f32,
+    explicit_width: Option<f32>,
+    available_width: f32,
     border_spacing: f32,
     ctx: &LayoutContext,
 ) -> Vec<f32> {
     let num_cols = table.num_columns().max(1);
     let total_spacing = border_spacing * (num_cols + 1) as f32;
-    let available = (table_width - total_spacing).max(0.0);
-
-    // Simplified auto layout: measure minimum and preferred widths
-    let mut min_widths = vec![0.0f32; num_cols];
-    let mut pref_widths = vec![0.0f32; num_cols];
-
-    for row in &table.rows {
-        for cell in &row.cells {
-            if cell.col_span == 1 && cell.col_start < num_cols {
-                let cell_style = ctx.tree.style(cell.node);
-
-                // If cell has explicit width, use that
-                if let Some(w) = cell_style.width.resolve(available) {
-                    pref_widths[cell.col_start] = pref_widths[cell.col_start].max(w);
-                    min_widths[cell.col_start] = min_widths[cell.col_start].max(w);
-                } else {
-                    // Content-based: use min/max content widths
-                    let min_w = 1.0; // minimum content width placeholder
-                    let pref_w = available / num_cols as f32;
-                    min_widths[cell.col_start] = min_widths[cell.col_start].max(min_w);
-                    pref_widths[cell.col_start] = pref_widths[cell.col_start].max(pref_w);
-                }
-            }
-        }
-    }
-
-    // Distribute available width
-    let total_pref: f32 = pref_widths.iter().sum();
-
-    if total_pref <= available {
-        // All preferred widths fit — distribute extra proportionally
-        let extra = available - total_pref;
-        let per_col = extra / num_cols as f32;
-        let mut result = pref_widths.clone();
-        for w in &mut result {
-            *w += per_col;
-        }
-        result
-    } else {
-        // Need to shrink — use minimum widths as floor
-        let total_min: f32 = min_widths.iter().sum();
-        if total_min >= available {
-            // Even minimums don't fit — use minimums
-            min_widths
+    let (mins, maxs, fixed) = column_widths(table, ctx, available_width - total_spacing);
+    let sum_min: f32 = mins.iter().sum();
+    let sum_max: f32 = maxs.iter().sum();
+    let target = explicit_width
+        .unwrap_or(available_width)
+        .min(if explicit_width.is_some() {
+            f32::INFINITY
         } else {
-            // Interpolate between min and preferred
-            let flex_range = total_pref - total_min;
-            let available_range = available - total_min;
-            let factor = if flex_range > 0.0 {
-                available_range / flex_range
-            } else {
-                0.0
-            };
+            available_width
+        })
+        - total_spacing;
+    let target = target.max(0.0);
 
-            let mut result = Vec::with_capacity(num_cols);
-            for i in 0..num_cols {
-                let w = min_widths[i] + (pref_widths[i] - min_widths[i]) * factor;
-                result.push(w);
+    if sum_max <= target {
+        let mut widths = maxs.clone();
+        if explicit_width.is_some() {
+            // Distribute the surplus, preferring columns without a set width.
+            let extra = target - sum_max;
+            let flexible: Vec<usize> = (0..num_cols).filter(|&i| !fixed[i]).collect();
+            let pool: Vec<usize> = if flexible.is_empty() {
+                (0..num_cols).collect()
+            } else {
+                flexible
+            };
+            let weight: f32 = pool.iter().map(|&i| maxs[i]).sum();
+            for &i in &pool {
+                widths[i] += if weight > 0.0 {
+                    extra * maxs[i] / weight
+                } else {
+                    extra / pool.len() as f32
+                };
             }
-            result
         }
+        widths
+    } else if sum_min >= target {
+        mins
+    } else {
+        let range = sum_max - sum_min;
+        let factor = if range > 0.0 {
+            (target - sum_min) / range
+        } else {
+            0.0
+        };
+        (0..num_cols)
+            .map(|i| mins[i] + (maxs[i] - mins[i]) * factor)
+            .collect()
     }
 }
 
@@ -416,7 +492,7 @@ fn col_position(col_widths: &[f32], col_idx: usize, border_spacing: f32) -> f32 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{compute_layout, FixedWidthTextMeasure};
+    use crate::layout::{compute_layout, FixedWidthTextMeasure, TextMeasure};
     use crate::style::ComputedStyle;
     use crate::tree::BoxTreeBuilder;
     use crate::values::LengthPercentageAuto;
@@ -461,8 +537,91 @@ mod tests {
         let result = compute_layout(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
 
         let root_layout = result.bounding_rect(tree.root()).unwrap();
-        assert!(root_layout.width >= 800.0);
+        // Empty cells: an auto-width table shrinks to its (empty) content.
+        assert!(root_layout.width < 800.0);
         assert!(root_layout.height > 0.0);
+    }
+
+    fn r_lines(result: &crate::fragment::LayoutResult, node: NodeId) -> usize {
+        result
+            .find_fragment(node)
+            .map(|f| {
+                f.children
+                    .iter()
+                    .filter(|c| c.kind == FragmentKind::LineBox)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn text_cell(b: &mut BoxTreeBuilder, row: NodeId, words: &[&str]) -> NodeId {
+        let mut s = make_cell_style();
+        s.height = LengthPercentageAuto::Auto;
+        let c = b.element(row, s);
+        for w in words {
+            b.text(c, w);
+        }
+        c
+    }
+
+    #[test]
+    fn test_auto_columns_follow_content() {
+        // A results-style table: a narrow number column beside long text.
+        let mut b = BoxTreeBuilder::new();
+        let root = b.root(ComputedStyle::block());
+        let table = b.element(root, make_table_style());
+        let row = b.element(table, make_row_style());
+        let num = text_cell(&mut b, row, &["1."]);
+        let long: Vec<&str> = std::iter::repeat_n("lorem ", 60).collect();
+        let text = text_cell(&mut b, row, &long);
+        let tree = b.build();
+        let result = compute_layout(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
+        let n = result.bounding_rect(num).unwrap();
+        let t = result.bounding_rect(text).unwrap();
+        // "1." is 16px; the text column takes the rest of the 800px line.
+        assert!(n.width < 30.0, "number column {}", n.width);
+        assert!(t.width > 700.0, "text column {}", t.width);
+        // The long text wraps onto several lines inside its column, while the
+        // number stays on one (the row stretches both cells to its height).
+        let line = crate::layout::FixedWidthTextMeasure
+            .measure_styled("1.", tree.style(num), 800.0)
+            .height;
+        let lines = r_lines(&result, text);
+        assert!(lines >= 3, "lines {lines}");
+        assert!(t.height >= line * 3.0);
+    }
+
+    #[test]
+    fn test_auto_table_shrinks_and_fills() {
+        let build = |width: Option<f32>| {
+            let mut b = BoxTreeBuilder::new();
+            let root = b.root(ComputedStyle::block());
+            let mut ts = make_table_style();
+            if let Some(p) = width {
+                ts.width = LengthPercentageAuto::percent(p);
+            }
+            let table = b.element(root, ts);
+            let row = b.element(table, make_row_style());
+            let a = text_cell(&mut b, row, &["aaaa"]);
+            let c = text_cell(&mut b, row, &["bbbbbbbb"]);
+            (b.build(), table, a, c)
+        };
+        let (tree, table, a, c) = build(None);
+        let r = compute_layout(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
+        // Shrink-to-fit: 32px + 64px of content.
+        assert_eq!(r.bounding_rect(table).unwrap().width, 96.0);
+        assert_eq!(r.bounding_rect(a).unwrap().width, 32.0);
+        assert_eq!(r.bounding_rect(c).unwrap().width, 64.0);
+
+        let (tree, table, a, c) = build(Some(100.0));
+        let r = compute_layout(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
+        assert!((r.bounding_rect(table).unwrap().width - 800.0).abs() < 0.01);
+        // Extra space is shared in proportion to content (1:2).
+        let (wa, wc) = (
+            r.bounding_rect(a).unwrap().width,
+            r.bounding_rect(c).unwrap().width,
+        );
+        assert!((wc / wa - 2.0).abs() < 0.01, "{wa} {wc}");
     }
 
     #[test]
