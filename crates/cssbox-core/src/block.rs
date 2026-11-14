@@ -24,11 +24,18 @@ pub fn layout_block(
     let forced_height = ctx.take_forced_height(node);
 
     // 1. Resolve width and margins
-    let (content_width, margin) = resolve_block_width(style, containing_block_width);
+    let (mut content_width, margin) = resolve_block_width(style, containing_block_width);
 
     // 2. Resolve border and padding
     let border = BoxModel::resolve_border(style);
     let padding = BoxModel::resolve_padding(style, containing_block_width);
+    if let Some(fw) = ctx.take_forced_width(node) {
+        content_width = (fw - border.horizontal() - padding.horizontal()).max(0.0);
+    }
+    let establishes_cb = style.position.is_positioned();
+    if establishes_cb {
+        ctx.push_positioned_width(content_width + padding.horizontal());
+    }
 
     fragment.margin = margin;
     fragment.border = border;
@@ -135,6 +142,9 @@ pub fn layout_block(
     }
 
     fragment.size = Size::new(content_width, final_height);
+    if establishes_cb {
+        ctx.pop_positioned_width();
+    }
 
     fragment
 }
@@ -169,10 +179,31 @@ fn layout_block_children(
 
         // Handle out-of-flow elements
         if child_style.position.is_absolutely_positioned() {
-            // Absolutely positioned elements are laid out later in position::resolve_positioned
-            let mut child_fragment =
-                layout::layout_node(ctx, child_id, containing_width, containing_height);
-            child_fragment.position = Point::ZERO; // placeholder, resolved later
+            // Absolutely positioned elements are placed later in
+            // position::resolve_positioned; here we fix their width (which
+            // needs the containing block) and record the static position.
+            let fixed = child_style.position == crate::style::Position::Fixed;
+            let cb_w = ctx.abs_containing_width(fixed);
+            let bm = BoxModel::resolve(child_style, cb_w);
+            let left = child_style.left.resolve(cb_w);
+            let right = child_style.right.resolve(cb_w);
+            if child_style.width.is_auto() {
+                let bp = bm.horizontal_border_padding();
+                let ml = bm.margin.left;
+                let mr = bm.margin.right;
+                let w = match (left, right) {
+                    (Some(l), Some(r)) => cb_w - l - r - ml - mr,
+                    _ => {
+                        let avail = (cb_w - left.unwrap_or(0.0) - right.unwrap_or(0.0) - ml - mr)
+                            .max(0.0);
+                        shrink_to_fit_width(ctx, child_id, avail) + bp
+                    }
+                };
+                ctx.force_width(child_id, w.max(0.0));
+            }
+            let mut child_fragment = layout::layout_node(ctx, child_id, cb_w, containing_height);
+            let static_y = cursor_y + pending_margin.unwrap_or(0.0).max(0.0);
+            child_fragment.position = Point::new(child_fragment.margin.left, static_y);
             fragments.push(child_fragment);
             continue;
         }
