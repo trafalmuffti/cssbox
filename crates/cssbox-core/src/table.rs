@@ -87,56 +87,82 @@ pub fn layout_table(
         }
     }
 
-    // Layout rows
-    for row in table.rows.iter() {
-        let mut row_height: f32 = 0.0;
-        let mut cell_fragments: Vec<(usize, Fragment)> = Vec::new();
-
+    // Layout rows. Pass 1: lay out every cell and find row heights; cells
+    // spanning several rows only grow the last row they cover if needed.
+    struct Placed {
+        row: usize,
+        col: usize,
+        rows: usize,
+        frag: Fragment,
+    }
+    let nrows = table.rows.len();
+    let mut placed: Vec<Placed> = Vec::new();
+    let mut row_heights = vec![0.0f32; nrows];
+    for (ri, row) in table.rows.iter().enumerate() {
         for cell in &row.cells {
             let col_idx = cell.col_start;
-            let col_span = cell.col_span;
-
-            // Calculate cell width
             let mut cell_width = 0.0f32;
-            for c in col_idx..(col_idx + col_span).min(num_cols) {
+            for c in col_idx..(col_idx + cell.col_span).min(num_cols) {
                 cell_width += col_widths[c];
                 if c > col_idx {
                     cell_width += border_spacing;
                 }
             }
-
-            // Layout cell content
-            let cell_frag =
-                layout::layout_node(ctx, cell.node, cell_width, containing_block_height);
-
-            let cell_total_height = cell_frag.border_box().height;
-            row_height = row_height.max(cell_total_height);
-
-            cell_fragments.push((col_idx, cell_frag));
+            let frag = layout::layout_node(ctx, cell.node, cell_width, containing_block_height);
+            let rows = cell.row_span.min(nrows - ri).max(1);
+            if rows == 1 {
+                row_heights[ri] = row_heights[ri].max(frag.border_box().height);
+            }
+            placed.push(Placed {
+                row: ri,
+                col: col_idx,
+                rows,
+                frag,
+            });
         }
-
-        // Resolve specified row height
         if let Some(row_node) = row.node {
             let row_style = ctx.tree.style(row_node);
             if let Some(h) = row_style.height.resolve(containing_block_height) {
-                row_height = row_height.max(h);
+                row_heights[ri] = row_heights[ri].max(h);
             }
         }
-
-        // Position cells; every cell in a row is as tall as the row, so cell
-        // backgrounds and borders line up.
-        for (col_idx, mut cell_frag) in cell_fragments {
-            let x = col_position(&col_widths, col_idx, border_spacing);
-            cell_frag.position = Point::new(x, cursor_y);
-            let extra = cell_frag.padding.vertical() + cell_frag.border.vertical();
-            cell_frag.size.height = cell_frag.size.height.max(row_height - extra);
-
-            // Vertical alignment in cell — default to top
-            // TODO: implement vertical-align for table cells
-            fragment.children.push(cell_frag);
+    }
+    for p in placed.iter().filter(|p| p.rows > 1) {
+        let have: f32 = row_heights[p.row..p.row + p.rows].iter().sum::<f32>()
+            + border_spacing * (p.rows - 1) as f32;
+        let need = p.frag.border_box().height;
+        if need > have {
+            row_heights[p.row + p.rows - 1] += need - have;
         }
-
-        cursor_y += row_height + border_spacing;
+    }
+    let mut row_tops = Vec::with_capacity(nrows);
+    for h in &row_heights {
+        row_tops.push(cursor_y);
+        cursor_y += h + border_spacing;
+    }
+    // Pass 2: position cells, stretch them to their rows, align vertically.
+    for mut p in placed {
+        let height: f32 = row_heights[p.row..p.row + p.rows].iter().sum::<f32>()
+            + border_spacing * (p.rows - 1) as f32;
+        let x = col_position(&col_widths, p.col, border_spacing);
+        p.frag.position = Point::new(x, row_tops[p.row]);
+        let extra = p.frag.padding.vertical() + p.frag.border.vertical();
+        let content_used = p.frag.size.height;
+        let new_h = content_used.max(height - extra);
+        let slack = new_h - content_used;
+        p.frag.size.height = new_h;
+        let valign = ctx.tree.style(p.frag.node).vertical_align;
+        let shift = match valign {
+            crate::style::VerticalAlign::Middle => slack / 2.0,
+            crate::style::VerticalAlign::Bottom => slack,
+            _ => 0.0,
+        };
+        if shift > 0.0 {
+            for c in &mut p.frag.children {
+                c.position.y += shift;
+            }
+        }
+        fragment.children.push(p.frag);
     }
 
     // Layout captions (bottom)
@@ -171,6 +197,8 @@ pub fn layout_table(
 // --- Table structure collection ---
 
 struct TableStructure {
+    /// Grid slots already taken by cells spanning down from earlier rows.
+    occupied: Vec<Vec<bool>>,
     rows: Vec<TableRow>,
     captions: Vec<NodeId>,
     column_specs: Vec<ColumnSpec>,
@@ -185,6 +213,7 @@ struct TableCell {
     node: NodeId,
     col_start: usize,
     col_span: usize,
+    row_span: usize,
 }
 
 struct ColumnSpec {
@@ -194,6 +223,7 @@ struct ColumnSpec {
 impl TableStructure {
     fn new() -> Self {
         Self {
+            occupied: Vec::new(),
             rows: Vec::new(),
             captions: Vec::new(),
             column_specs: Vec::new(),
@@ -252,6 +282,7 @@ fn collect_table_structure(ctx: &LayoutContext, table_node: NodeId, table: &mut 
                         node: child_id,
                         col_start: 0,
                         col_span: 1,
+                        row_span: 1,
                     }],
                 };
                 table.rows.push(row);
@@ -267,19 +298,41 @@ fn collect_row(ctx: &LayoutContext, row_node: NodeId, table: &mut TableStructure
     let children = ctx.tree.children(row_node);
     let mut cells = Vec::new();
     let mut col = 0;
+    let row_idx = table.rows.len();
+    while table.occupied.len() <= row_idx {
+        table.occupied.push(Vec::new());
+    }
 
     for &child_id in children {
         let child_style = ctx.tree.style(child_id);
         if child_style.display.is_none() {
             continue;
         }
-
+        // Skip slots taken by cells spanning down from above.
+        while table.occupied[row_idx].get(col).copied().unwrap_or(false) {
+            col += 1;
+        }
+        let col_span = (child_style.col_span.max(1) as usize).min(1000);
+        let row_span = (child_style.row_span.max(1) as usize).min(1000);
+        for r in row_idx..row_idx + row_span {
+            while table.occupied.len() <= r {
+                table.occupied.push(Vec::new());
+            }
+            let occ = &mut table.occupied[r];
+            if occ.len() < col + col_span {
+                occ.resize(col + col_span, false);
+            }
+            for slot in &mut occ[col..col + col_span] {
+                *slot = true;
+            }
+        }
         cells.push(TableCell {
             node: child_id,
             col_start: col,
-            col_span: 1, // TODO: colspan attribute support
+            col_span,
+            row_span,
         });
-        col += 1;
+        col += col_span;
     }
 
     table.rows.push(TableRow {

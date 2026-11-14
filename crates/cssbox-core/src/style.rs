@@ -538,6 +538,9 @@ pub struct ComputedStyle {
     pub border_collapse: BorderCollapse,
     pub border_spacing: f32,
     pub caption_side: CaptionSide,
+    /// `colspan` / `rowspan` of a table cell (HTML attributes), at least 1.
+    pub col_span: u32,
+    pub row_span: u32,
 
     // Z-index
     pub z_index: crate::values::NumberOrAuto,
@@ -617,6 +620,8 @@ impl Default for ComputedStyle {
             border_collapse: BorderCollapse::Separate,
             border_spacing: 0.0,
             caption_side: CaptionSide::Top,
+            col_span: 1,
+            row_span: 1,
 
             z_index: crate::values::NumberOrAuto::Auto,
         }

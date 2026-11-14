@@ -196,7 +196,9 @@ fn layout_block_children(
                     _ => {
                         let avail = (cb_w - left.unwrap_or(0.0) - right.unwrap_or(0.0) - ml - mr)
                             .max(0.0);
-                        shrink_to_fit_width(ctx, child_id, avail) + bp
+                        let (mn, mx) = crate::intrinsic::intrinsic_widths(ctx, child_id);
+                        let _ = bp;
+                        mn.max(avail).min(mx.max(mn))
                     }
                 };
                 ctx.force_width(child_id, w.max(0.0));

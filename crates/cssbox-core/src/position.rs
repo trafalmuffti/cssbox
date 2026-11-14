@@ -42,7 +42,14 @@ fn resolve_fragment(
 ) {
     let style = tree.style(fragment.node);
 
-    match style.position {
+    // Line boxes and anonymous boxes share their container's node (and so its
+    // style); only real boxes are offset.
+    let position = if fragment.kind == crate::fragment::FragmentKind::Box {
+        style.position
+    } else {
+        Position::Static
+    };
+    match position {
         Position::Relative | Position::Sticky => {
             apply_relative_offset(fragment, style, cb.size);
         }
@@ -67,7 +74,7 @@ fn resolve_fragment(
         border_box_origin.x + fragment.border.left + fragment.padding.left,
         border_box_origin.y + fragment.border.top + fragment.padding.top,
     );
-    let child_cb = if style.position.is_positioned() {
+    let child_cb = if position.is_positioned() {
         Cb {
             origin: Point::new(
                 border_box_origin.x + fragment.border.left,
