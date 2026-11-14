@@ -109,8 +109,7 @@ fn apply_relative_offset(fragment: &mut Fragment, style: &ComputedStyle, cb_size
 /// offsets `auto` keep it.
 fn place_absolute(fragment: &mut Fragment, style: &ComputedStyle, parent_origin: Point, cb: Cb) {
     let bb_w = fragment.size.width + fragment.padding.horizontal() + fragment.border.horizontal();
-    let mut bb_h =
-        fragment.size.height + fragment.padding.vertical() + fragment.border.vertical();
+    let mut bb_h = fragment.size.height + fragment.padding.vertical() + fragment.border.vertical();
     let left = style.left.resolve(cb.size.width);
     let right = style.right.resolve(cb.size.width);
     let top = style.top.resolve(cb.size.height);
@@ -129,16 +128,12 @@ fn place_absolute(fragment: &mut Fragment, style: &ComputedStyle, parent_origin:
     // Absolute document coordinates of the border box's top-left.
     let abs_x = match (left, right) {
         (Some(l), _) => Some(cb.origin.x + l + fragment.margin.left),
-        (None, Some(r)) => {
-            Some(cb.origin.x + cb.size.width - r - fragment.margin.right - bb_w)
-        }
+        (None, Some(r)) => Some(cb.origin.x + cb.size.width - r - fragment.margin.right - bb_w),
         _ => None,
     };
     let abs_y = match (top, bottom) {
         (Some(t), _) => Some(cb.origin.y + t + fragment.margin.top),
-        (None, Some(b)) => {
-            Some(cb.origin.y + cb.size.height - b - fragment.margin.bottom - bb_h)
-        }
+        (None, Some(b)) => Some(cb.origin.y + cb.size.height - b - fragment.margin.bottom - bb_h),
         _ => None,
     };
     if let Some(x) = abs_x {

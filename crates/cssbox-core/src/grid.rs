@@ -103,7 +103,8 @@ pub fn layout_grid(
 
     // §8: Place items onto the grid
     let n_cols = explicit_cols.len().max(1);
-    let (grid_col_count, grid_row_count) = place_items(&mut items, n_cols, explicit_rows.len(), style);
+    let (grid_col_count, grid_row_count) =
+        place_items(&mut items, n_cols, explicit_rows.len(), style);
 
     // §12: Track sizing. Columns first (items' widths feed rows' heights).
     let col_sizes = size_tracks(
@@ -160,7 +161,10 @@ pub fn layout_grid(
         let item_box = BoxModel::resolve(child_style, item_width);
         // Items with an auto height stretch to their area.
         if matches!(align, AlignItems::Stretch) && child_style.height.is_auto() {
-            ctx.force_height(item.node, (item_height - item_box.margin.vertical()).max(0.0));
+            ctx.force_height(
+                item.node,
+                (item_height - item_box.margin.vertical()).max(0.0),
+            );
         }
         let mut child_frag = layout::layout_node(ctx, item.node, item_width, item_height);
 
@@ -359,7 +363,11 @@ fn place_items(
             // Fill columns top to bottom within the explicit rows.
             let limit = rows.max(rs);
             let mut c = it.col.start.unwrap_or(if dense { 0 } else { cur_c });
-            let mut r = it.row.start.unwrap_or(if dense || it.col.start.is_some() { 0 } else { cur_r });
+            let mut r = it.row.start.unwrap_or(if dense || it.col.start.is_some() {
+                0
+            } else {
+                cur_r
+            });
             loop {
                 if r + rs > limit && it.row.start.is_none() {
                     r = 0;
@@ -384,7 +392,11 @@ fn place_items(
         } else {
             let limit = cols.max(cs);
             let mut r = it.row.start.unwrap_or(if dense { 0 } else { cur_r });
-            let mut c = it.col.start.unwrap_or(if dense || it.row.start.is_some() { 0 } else { cur_c });
+            let mut c = it.col.start.unwrap_or(if dense || it.row.start.is_some() {
+                0
+            } else {
+                cur_c
+            });
             loop {
                 if c + cs > limit && it.col.start.is_none() {
                     c = 0;
@@ -456,16 +468,50 @@ fn size_tracks(
     let mut tracks: Vec<Track> = Vec::with_capacity(track_count);
     for i in 0..track_count {
         let t = match sizing_for(i) {
-            T::Length(px) => Track { base: px, limit: px, flex: 0.0, auto: false, content: false },
-            T::Percentage(p) => match avail_tracks {
-                Some(a) => Track { base: a * p, limit: a * p, flex: 0.0, auto: false, content: false },
-                None => Track { base: 0.0, limit: f32::INFINITY, flex: 0.0, auto: true, content: true },
+            T::Length(px) => Track {
+                base: px,
+                limit: px,
+                flex: 0.0,
+                auto: false,
+                content: false,
             },
-            T::Fr(f) => Track { base: 0.0, limit: 0.0, flex: f.max(0.0), auto: false, content: true },
-            T::Auto => Track { base: 0.0, limit: f32::INFINITY, flex: 0.0, auto: true, content: true },
-            T::MinContent | T::MaxContent | T::FitContent(_) => {
-                Track { base: 0.0, limit: f32::INFINITY, flex: 0.0, auto: false, content: true }
-            }
+            T::Percentage(p) => match avail_tracks {
+                Some(a) => Track {
+                    base: a * p,
+                    limit: a * p,
+                    flex: 0.0,
+                    auto: false,
+                    content: false,
+                },
+                None => Track {
+                    base: 0.0,
+                    limit: f32::INFINITY,
+                    flex: 0.0,
+                    auto: true,
+                    content: true,
+                },
+            },
+            T::Fr(f) => Track {
+                base: 0.0,
+                limit: 0.0,
+                flex: f.max(0.0),
+                auto: false,
+                content: true,
+            },
+            T::Auto => Track {
+                base: 0.0,
+                limit: f32::INFINITY,
+                flex: 0.0,
+                auto: true,
+                content: true,
+            },
+            T::MinContent | T::MaxContent | T::FitContent(_) => Track {
+                base: 0.0,
+                limit: f32::INFINITY,
+                flex: 0.0,
+                auto: false,
+                content: true,
+            },
             T::MinMax(min, max) => {
                 let base = match *min {
                     T::Length(px) => px,
@@ -473,13 +519,37 @@ fn size_tracks(
                     _ => 0.0,
                 };
                 match *max {
-                    T::Length(px) => Track { base: base.min(px), limit: px, flex: 0.0, auto: false, content: !matches!(*min, T::Length(_)) },
+                    T::Length(px) => Track {
+                        base: base.min(px),
+                        limit: px,
+                        flex: 0.0,
+                        auto: false,
+                        content: !matches!(*min, T::Length(_)),
+                    },
                     T::Percentage(p) => {
                         let l = avail_tracks.map(|a| a * p).unwrap_or(f32::INFINITY);
-                        Track { base: base.min(l), limit: l, flex: 0.0, auto: false, content: !matches!(*min, T::Length(_)) }
+                        Track {
+                            base: base.min(l),
+                            limit: l,
+                            flex: 0.0,
+                            auto: false,
+                            content: !matches!(*min, T::Length(_)),
+                        }
                     }
-                    T::Fr(f) => Track { base, limit: base, flex: f.max(0.0), auto: false, content: !matches!(*min, T::Length(_)) },
-                    _ => Track { base, limit: f32::INFINITY, flex: 0.0, auto: true, content: !matches!(*min, T::Length(_)) },
+                    T::Fr(f) => Track {
+                        base,
+                        limit: base,
+                        flex: f.max(0.0),
+                        auto: false,
+                        content: !matches!(*min, T::Length(_)),
+                    },
+                    _ => Track {
+                        base,
+                        limit: f32::INFINITY,
+                        flex: 0.0,
+                        auto: true,
+                        content: !matches!(*min, T::Length(_)),
+                    },
                 }
             }
         };
@@ -514,7 +584,13 @@ fn size_tracks(
         }
     };
     let span_of = |it: &GridItem| if is_column { it.col_span } else { it.row_span };
-    let start_of = |it: &GridItem| if is_column { it.col_start } else { it.row_start };
+    let start_of = |it: &GridItem| {
+        if is_column {
+            it.col_start
+        } else {
+            it.row_start
+        }
+    };
     // Single-track spans first, then multi-track spans.
     for pass in [true, false] {
         for it in items {
@@ -532,8 +608,8 @@ fn size_tracks(
             if content_tracks.is_empty() {
                 continue;
             }
-            let covered: f32 = (from..to).map(|i| tracks[i].base).sum::<f32>()
-                + gap * (to - from - 1) as f32;
+            let covered: f32 =
+                (from..to).map(|i| tracks[i].base).sum::<f32>() + gap * (to - from - 1) as f32;
             let need_min = (mn - covered).max(0.0) / content_tracks.len() as f32;
             let covered_lim: f32 = (from..to)
                 .map(|i| tracks[i].limit.min(1e9).max(tracks[i].base))
@@ -551,7 +627,11 @@ fn size_tracks(
                     tracks[i].base += need_min;
                     if tracks[i].limit.is_infinite() {
                         let extra = (mx - covered_lim).max(0.0) / content_tracks.len() as f32;
-                        let cur = if tracks[i].limit.is_finite() { tracks[i].limit } else { 0.0 };
+                        let cur = if tracks[i].limit.is_finite() {
+                            tracks[i].limit
+                        } else {
+                            0.0
+                        };
                         tracks[i].limit = (cur.max(tracks[i].base) + extra).max(tracks[i].base);
                     }
                 }
@@ -626,10 +706,16 @@ fn size_tracks(
             .map(|(i, _)| sizes[i])
             .sum();
         let mut leftover = (avail - fixed).max(0.0);
-        let mut flex_left: Vec<usize> = (0..tracks.len()).filter(|&i| tracks[i].flex > 0.0).collect();
+        let mut flex_left: Vec<usize> = (0..tracks.len())
+            .filter(|&i| tracks[i].flex > 0.0)
+            .collect();
         // Tracks whose minimum exceeds their share are frozen at the minimum.
         loop {
-            let sum_f: f32 = flex_left.iter().map(|&i| tracks[i].flex).sum::<f32>().max(1.0);
+            let sum_f: f32 = flex_left
+                .iter()
+                .map(|&i| tracks[i].flex)
+                .sum::<f32>()
+                .max(1.0);
             let per = leftover / sum_f.max(1.0);
             let mut froze = false;
             flex_left.retain(|&i| {
@@ -674,19 +760,6 @@ fn gap_for_columns(ctx: &LayoutContext, node: NodeId, _columns: &[f32]) -> f32 {
         .parent(node)
         .map(|p| ctx.tree.style(p).column_gap)
         .unwrap_or(0.0)
-}
-
-fn track_fn_to_px(func: &TrackSizingFunction, available: f32) -> f32 {
-    match func {
-        TrackSizingFunction::Length(px) => *px,
-        TrackSizingFunction::Percentage(pct) => available * pct,
-        TrackSizingFunction::Auto => 0.0,
-        TrackSizingFunction::MinContent => 0.0,
-        TrackSizingFunction::MaxContent => available,
-        TrackSizingFunction::Fr(_) => 0.0,
-        TrackSizingFunction::MinMax(min, _) => track_fn_to_px(min, available),
-        TrackSizingFunction::FitContent(limit) => *limit,
-    }
 }
 
 fn track_positions(sizes: &[f32], gap: f32) -> Vec<f32> {

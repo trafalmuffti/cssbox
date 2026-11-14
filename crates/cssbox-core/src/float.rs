@@ -194,8 +194,16 @@ impl FloatContext {
 
     /// Floats placed in this context (not inherited), as `(rect, side)`.
     pub fn own_floats(&self) -> Vec<(Rect, Float)> {
-        let l = self.left_floats.iter().filter(|f| f.own).map(|f| (f.rect, Float::Left));
-        let r = self.right_floats.iter().filter(|f| f.own).map(|f| (f.rect, Float::Right));
+        let l = self
+            .left_floats
+            .iter()
+            .filter(|f| f.own)
+            .map(|f| (f.rect, Float::Left));
+        let r = self
+            .right_floats
+            .iter()
+            .filter(|f| f.own)
+            .map(|f| (f.rect, Float::Right));
         l.chain(r).collect()
     }
 

@@ -197,8 +197,8 @@ fn layout_block_children(
                 let w = match (left, right) {
                     (Some(l), Some(r)) => cb_w - l - r - ml - mr,
                     _ => {
-                        let avail = (cb_w - left.unwrap_or(0.0) - right.unwrap_or(0.0) - ml - mr)
-                            .max(0.0);
+                        let avail =
+                            (cb_w - left.unwrap_or(0.0) - right.unwrap_or(0.0) - ml - mr).max(0.0);
                         let (mn, mx) = crate::intrinsic::intrinsic_widths(ctx, child_id);
                         let _ = bp;
                         mn.max(avail).min(mx.max(mn))
@@ -293,9 +293,8 @@ fn layout_block_children(
             let dx = child_fragment.position.x
                 + child_fragment.border.left
                 + child_fragment.padding.left;
-            let dy = child_fragment.position.y
-                + child_fragment.border.top
-                + child_fragment.padding.top;
+            let dy =
+                child_fragment.position.y + child_fragment.border.top + child_fragment.padding.top;
             for (r, side) in ctx.take_escaped(child_id) {
                 float_ctx.add_escaped(Rect::new(r.x + dx, r.y + dy, r.width, r.height), side);
             }

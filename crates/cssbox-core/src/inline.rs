@@ -163,10 +163,8 @@ pub fn layout_inline_formatting_context(
             let item_fragment = match item.atomic {
                 _ if item.block.is_some() => {
                     let mut f = item.block.clone().unwrap();
-                    f.position = Point::new(
-                        current_x + f.margin.left,
-                        vertical_offset + f.margin.top,
-                    );
+                    f.position =
+                        Point::new(current_x + f.margin.left, vertical_offset + f.margin.top);
                     f
                 }
                 Some(atomic) => {

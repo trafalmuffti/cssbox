@@ -178,7 +178,11 @@ impl<'a> LayoutContext<'a> {
         if fixed {
             self.viewport.width
         } else {
-            *self.positioned_widths.borrow().last().unwrap_or(&self.viewport.width)
+            *self
+                .positioned_widths
+                .borrow()
+                .last()
+                .unwrap_or(&self.viewport.width)
         }
     }
 
