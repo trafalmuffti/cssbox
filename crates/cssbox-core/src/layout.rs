@@ -100,6 +100,9 @@ pub struct LayoutContext<'a> {
     /// Float exclusions handed from a block to a child that shares its
     /// block formatting context, in the child's content-box coordinates.
     inherited_floats: core::cell::RefCell<Vec<(NodeId, FloatList)>>,
+    /// Floats a block leaves behind in its parent's block formatting
+    /// context, in the block's content-box coordinates.
+    escaped_floats: core::cell::RefCell<Vec<(NodeId, FloatList)>>,
 }
 
 impl<'a> LayoutContext<'a> {
@@ -112,6 +115,7 @@ impl<'a> LayoutContext<'a> {
             forced_widths: core::cell::RefCell::new(Vec::new()),
             positioned_widths: core::cell::RefCell::new(vec![viewport.width]),
             inherited_floats: core::cell::RefCell::new(Vec::new()),
+            escaped_floats: core::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -119,6 +123,23 @@ impl<'a> LayoutContext<'a> {
         let mut v = self.inherited_floats.borrow_mut();
         v.retain(|(n, _)| *n != node);
         v.push((node, floats));
+    }
+
+    pub(crate) fn escape_floats(&self, node: NodeId, floats: FloatList) {
+        if floats.is_empty() {
+            return;
+        }
+        let mut v = self.escaped_floats.borrow_mut();
+        v.retain(|(n, _)| *n != node);
+        v.push((node, floats));
+    }
+
+    pub(crate) fn take_escaped(&self, node: NodeId) -> FloatList {
+        let mut v = self.escaped_floats.borrow_mut();
+        match v.iter().position(|(n, _)| *n == node) {
+            Some(i) => v.swap_remove(i).1,
+            None => Vec::new(),
+        }
     }
 
     pub(crate) fn take_floats(&self, node: NodeId) -> FloatList {

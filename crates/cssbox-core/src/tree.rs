@@ -161,7 +161,13 @@ impl BoxTree {
                     cs.display.is_block_level() && !cs.is_out_of_flow()
                 });
 
-                if has_block {
+                // Only floats / absolutely positioned boxes: the block
+                // algorithm places them; there are no lines to flow.
+                let only_out_of_flow = children.iter().all(|&c| {
+                    let cs = self.style(c);
+                    cs.display.is_none() || cs.is_out_of_flow()
+                });
+                if has_block || only_out_of_flow {
                     FormattingContextType::Block
                 } else {
                     FormattingContextType::Inline

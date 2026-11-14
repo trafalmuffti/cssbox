@@ -27,6 +27,8 @@ pub struct FloatContext {
 struct FloatBox {
     /// Position and size of the float's margin box.
     rect: Rect,
+    /// Placed in (or escaped into) this context, not handed down from an ancestor.
+    own: bool,
 }
 
 impl FloatContext {
@@ -96,6 +98,7 @@ impl FloatContext {
                 // Record this float
                 let float_box = FloatBox {
                     rect: Rect::new(x, y, width, height),
+                    own: true,
                 };
 
                 match float_type {
@@ -126,6 +129,7 @@ impl FloatContext {
 
                 let float_box = FloatBox {
                     rect: Rect::new(x, y, width, height),
+                    own: true,
                 };
 
                 match float_type {
@@ -179,7 +183,24 @@ impl FloatContext {
 
     /// Add an exclusion inherited from an ancestor's float context.
     pub fn add_exclusion(&mut self, rect: Rect, side: Float) {
-        let fb = FloatBox { rect };
+        self.add_box(rect, side, false);
+    }
+
+    /// Add a float that escaped from a child block (same block formatting
+    /// context): it counts as this context's own and propagates further up.
+    pub fn add_escaped(&mut self, rect: Rect, side: Float) {
+        self.add_box(rect, side, true);
+    }
+
+    /// Floats placed in this context (not inherited), as `(rect, side)`.
+    pub fn own_floats(&self) -> Vec<(Rect, Float)> {
+        let l = self.left_floats.iter().filter(|f| f.own).map(|f| (f.rect, Float::Left));
+        let r = self.right_floats.iter().filter(|f| f.own).map(|f| (f.rect, Float::Right));
+        l.chain(r).collect()
+    }
+
+    fn add_box(&mut self, rect: Rect, side: Float, own: bool) {
+        let fb = FloatBox { rect, own };
         match side {
             Float::Left => self.left_floats.push(fb),
             Float::Right => self.right_floats.push(fb),
@@ -241,14 +262,14 @@ impl FloatContext {
         left_bottom.max(right_bottom)
     }
 
-    /// Compute the minimum y position for a new float (cannot be above existing floats).
-    fn compute_min_y_for_float(&self, float_type: &Float, cursor_y: f32) -> f32 {
-        let same_side_bottom = match float_type {
-            Float::Left => self.bottom_of_floats(&self.left_floats),
-            Float::Right => self.bottom_of_floats(&self.right_floats),
-            Float::None => 0.0,
-        };
-        cursor_y.max(same_side_bottom)
+    /// Compute the minimum y position for a new float. CSS 2.1 §9.5.1 rule 5:
+    /// a float's top may not be higher than the top of any earlier float.
+    fn compute_min_y_for_float(&self, _float_type: &Float, cursor_y: f32) -> f32 {
+        self.left_floats
+            .iter()
+            .chain(self.right_floats.iter())
+            .map(|f| f.rect.y)
+            .fold(cursor_y, f32::max)
     }
 
     /// Find the next y position where the available space might change.
@@ -365,9 +386,10 @@ mod tests {
         let frag2 = create_fragment(100.0, 50.0, 0.0);
         let placed2 = ctx.place_float(frag2, Float::Left, 0.0);
 
-        // Second left float stacks below the first (cannot be placed above previous same-side float)
-        assert_eq!(placed2.position.x, 0.0);
-        assert_eq!(placed2.position.y, 50.0);
+        // Second left float sits beside the first (CSS 2.1 §9.5.1 rule 5 only
+        // forbids placing it higher than the first).
+        assert_eq!(placed2.position.x, 100.0);
+        assert_eq!(placed2.position.y, 0.0);
     }
 
     #[test]
@@ -530,15 +552,14 @@ mod tests {
 
         let frag2 = create_fragment(100.0, 50.0, 0.0);
         let placed2 = ctx.place_float(frag2, Float::Left, 0.0);
-        // Stacks below first float (same-side floats stack vertically)
-        assert_eq!(placed2.position.x, 0.0);
-        assert_eq!(placed2.position.y, 50.0);
+        // Sits beside the first float while there is room.
+        assert_eq!(placed2.position.x, 100.0);
+        assert_eq!(placed2.position.y, 0.0);
 
         let frag3 = create_fragment(100.0, 50.0, 0.0);
         let placed3 = ctx.place_float(frag3, Float::Left, 0.0);
-        // Stacks below second float
-        assert_eq!(placed3.position.x, 0.0);
-        assert_eq!(placed3.position.y, 100.0);
+        assert_eq!(placed3.position.x, 200.0);
+        assert_eq!(placed3.position.y, 0.0);
     }
 
     #[test]

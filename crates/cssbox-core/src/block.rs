@@ -6,7 +6,7 @@
 use crate::box_model::{resolve_block_width, BoxModel};
 use crate::float::FloatContext;
 use crate::fragment::{Fragment, FragmentKind};
-use crate::geometry::{Point, Size};
+use crate::geometry::{Point, Rect, Size};
 use crate::inline;
 use crate::layout::{self, LayoutContext};
 use crate::style::{BoxSizing, DisplayInner, Float};
@@ -142,6 +142,9 @@ pub fn layout_block(
     }
 
     fragment.size = Size::new(content_width, final_height);
+    if !style.establishes_bfc() {
+        ctx.escape_floats(node, float_ctx.own_floats());
+    }
     if establishes_cb {
         ctx.pop_positioned_width();
     }
@@ -231,7 +234,11 @@ fn layout_block_children(
                 None => bm.margin.top,
             };
             let dx = bm.margin.left + bm.border.left + bm.padding.left;
-            let dy = cursor_y + est_offset + bm.border.top + bm.padding.top;
+            let mut top = cursor_y + est_offset;
+            if child_style.clear != crate::style::Clear::None {
+                top = top.max(float_ctx.clear(child_style.clear));
+            }
+            let dy = top + bm.border.top + bm.padding.top;
             ctx.pass_floats(child_id, float_ctx.exclusions_for_child(dx, dy));
         }
 
@@ -278,6 +285,20 @@ fn layout_block_children(
         } else {
             cursor_y += height;
             pending_margin = Some(margin_bottom);
+        }
+
+        // Floats inside a child that shares our block formatting context
+        // also affect what follows it.
+        if !child_style.establishes_bfc() {
+            let dx = child_fragment.position.x
+                + child_fragment.border.left
+                + child_fragment.padding.left;
+            let dy = child_fragment.position.y
+                + child_fragment.border.top
+                + child_fragment.padding.top;
+            for (r, side) in ctx.take_escaped(child_id) {
+                float_ctx.add_escaped(Rect::new(r.x + dx, r.y + dy, r.width, r.height), side);
+            }
         }
 
         fragments.push(child_fragment);
