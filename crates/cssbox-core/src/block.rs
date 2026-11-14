@@ -32,6 +32,19 @@ pub fn layout_block(
     if let Some(fw) = ctx.take_forced_width(node) {
         content_width = (fw - border.horizontal() - padding.horizontal()).max(0.0);
     }
+    // Percentage heights of children resolve against this box's height only
+    // when that is definite; otherwise they behave as `auto` (NaN = indefinite).
+    let child_cb_height = {
+        let def = match style.height.resolve(containing_block_height) {
+            Some(h) => Some(if style.box_sizing == BoxSizing::BorderBox {
+                (h - border.vertical() - padding.vertical()).max(0.0)
+            } else {
+                h
+            }),
+            None => forced_height.map(|h| (h - border.vertical() - padding.vertical()).max(0.0)),
+        };
+        def.unwrap_or(f32::NAN)
+    };
     let establishes_cb = style.position.is_positioned();
     if establishes_cb {
         ctx.push_positioned_width(content_width + padding.horizontal());
@@ -69,7 +82,7 @@ pub fn layout_block(
             ctx,
             node,
             content_width,
-            containing_block_height,
+            child_cb_height,
             &mut fragment.children,
             &mut float_ctx,
         ),
@@ -215,6 +228,13 @@ fn layout_block_children(
 
         // Handle floats
         if child_style.float != Float::None {
+            // A float with `width: auto` is as wide as its content (shrink-to-fit).
+            if child_style.width.is_auto() && !child_style.display.is_table_part() {
+                let bm = BoxModel::resolve(child_style, containing_width);
+                let (mn, mx) = crate::intrinsic::intrinsic_widths(ctx, child_id);
+                let avail = (containing_width - bm.margin.horizontal()).max(0.0);
+                ctx.force_width(child_id, mn.max(avail).min(mx.max(mn)));
+            }
             let mut child_fragment =
                 layout::layout_node(ctx, child_id, containing_width, containing_height);
             // Floats keep their specified margins (no over-constrained
@@ -268,10 +288,40 @@ fn layout_block_children(
                 first_margin_top = None;
             }
         }
+        // A box that establishes its own formatting context (table, flow-root,
+        // overflow, flex, grid) must not overlap floats beside it: it is
+        // narrowed, moved next to them, or pushed below them (CSS 2.1 §9.5).
+        let mut x_shift = 0.0f32;
+        if child_style.establishes_bfc() && float_ctx.has_floats() {
+            let top = cursor_y + offset;
+            let mut y = top;
+            let is_table = child_style.display.is_table_part();
+            for _ in 0..24 {
+                let h = child_fragment.border_box().height.max(1.0);
+                let (left, avail) = float_ctx.available_width_at(y, h);
+                let w_outer =
+                    child_fragment.border_box().width + child_fragment.margin.horizontal();
+                if avail + 0.01 >= w_outer {
+                    x_shift = left;
+                    break;
+                }
+                if !is_table && child_style.width.is_auto() && avail > 1.0 {
+                    child_fragment = layout::layout_node(ctx, child_id, avail, containing_height);
+                    x_shift = left;
+                    break;
+                }
+                let ny = float_ctx.next_y_after(y, h);
+                if ny <= y {
+                    break;
+                }
+                y = ny;
+            }
+            offset += y - top;
+        }
         cursor_y += offset;
 
         // Position is the top-left of the border box, offset by the left margin.
-        child_fragment.position = Point::new(child_fragment.margin.left, cursor_y);
+        child_fragment.position = Point::new(child_fragment.margin.left + x_shift, cursor_y);
 
         let height = child_fragment.border_box().height;
         if height == 0.0 {

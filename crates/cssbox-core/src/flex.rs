@@ -73,6 +73,9 @@ pub fn layout_flex(
         Some(content_box_width)
     };
 
+    // Items resolve percentage heights against this container only if it is definite.
+    let containing_block_height = definite_height.unwrap_or(f32::NAN);
+
     // §9.2: Collect flex items
     let children = ctx.tree.children(node);
     let mut items: Vec<FlexItem> = Vec::new();

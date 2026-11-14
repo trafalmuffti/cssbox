@@ -55,6 +55,8 @@ pub fn layout_grid(
         None => forced.map(|h| (h - border.vertical() - padding.vertical()).max(0.0)),
     };
 
+    let containing_block_height_outer = containing_block_height;
+    let containing_block_height = definite_height.unwrap_or(f32::NAN);
     // §7: Define the explicit grid
     let explicit_cols = &style.grid_template_columns;
     let explicit_rows = &style.grid_template_rows;
@@ -191,10 +193,10 @@ pub fn layout_grid(
     }
 
     let final_height = definite_height.unwrap_or(total_row_size);
-    let min_h = style.min_height.resolve(containing_block_height);
+    let min_h = style.min_height.resolve(containing_block_height_outer);
     let max_h = style
         .max_height
-        .resolve(containing_block_height)
+        .resolve(containing_block_height_outer)
         .unwrap_or(f32::INFINITY);
 
     fragment.size = Size::new(content_width, final_height.max(min_h).min(max_h));
