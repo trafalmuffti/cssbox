@@ -341,6 +341,9 @@ fn collect_inline_items(
             };
             ctx.force_width(child, outer_w);
             let mut frag = crate::layout::layout_node(ctx, child, max_width, ctx.viewport.height);
+            // Block width rules stretch the right margin of a box narrower than
+            // its container; an inline-block keeps the margins it specified.
+            frag.margin = bm.margin;
             let outer = Size::new(
                 frag.border_box().width + frag.margin.horizontal(),
                 frag.border_box().height + frag.margin.vertical(),
@@ -757,5 +760,39 @@ mod tests {
         let last = p.children.last().unwrap();
         assert!(last.position.y >= 30.0);
         assert_eq!(last.size.width, 200.0);
+    }
+}
+
+#[cfg(test)]
+mod inline_block_tests {
+    use super::*;
+    use crate::layout::{compute_layout, FixedWidthTextMeasure};
+    use crate::style::{ComputedStyle, Display};
+    use crate::tree::BoxTreeBuilder;
+    use crate::values::LengthPercentageAuto;
+
+    #[test]
+    fn inline_blocks_share_a_line() {
+        let mut b = BoxTreeBuilder::new();
+        let root = b.root(ComputedStyle::block());
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let mut st = ComputedStyle::block();
+            st.display = Display::INLINE_BLOCK;
+            st.width = LengthPercentageAuto::px(100.0);
+            let ib = b.element(root, st);
+            let inner = b.element(ib, ComputedStyle::block());
+            b.text(inner, "x");
+            ids.push(ib);
+        }
+        let tree = b.build();
+        let result = compute_layout(&tree, &FixedWidthTextMeasure, Size::new(600.0, 400.0));
+        let rects: Vec<_> = ids
+            .iter()
+            .map(|i| result.bounding_rect(*i).unwrap())
+            .collect();
+        assert_eq!(rects[0].width, 100.0);
+        assert!(rects[1].x >= 100.0 && rects[1].y == rects[0].y, "{rects:?}");
+        assert!(rects[2].x >= 200.0 && rects[2].y == rects[0].y, "{rects:?}");
     }
 }

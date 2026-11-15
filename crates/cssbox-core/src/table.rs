@@ -288,7 +288,17 @@ fn collect_table_structure(ctx: &LayoutContext, table_node: NodeId, table: &mut 
                 table.rows.push(row);
             }
             _ => {
-                // Treat as anonymous table cell
+                // Any other child (a block inside a `display: table` box, such
+                // as a thumbnail's link) is wrapped in an anonymous row and cell.
+                table.rows.push(TableRow {
+                    node: None,
+                    cells: vec![TableCell {
+                        node: child_id,
+                        col_start: 0,
+                        col_span: 1,
+                        row_span: 1,
+                    }],
+                });
             }
         }
     }
