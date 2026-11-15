@@ -110,11 +110,17 @@ impl FloatContext {
                 return fragment;
             }
 
-            // Doesn't fit; move down to the next constraint
-            y = self.next_y_position(y, height);
+            // Doesn't fit; move down to the next float edge. With none below,
+            // nothing changes further down (the float is wider than the
+            // container), so place it here. Each step moves to a strictly
+            // greater edge of a finite set, so the loop always ends; stepping
+            // by 1px instead stalled once y was large enough that y + 1 == y.
+            let next = self.next_y_position(y, height);
+            if let Some(n) = next {
+                y = n;
+            }
 
-            // Safety check to prevent infinite loops
-            if y > cursor_y + 100000.0 {
+            if next.is_none() || y > cursor_y + 100000.0 {
                 // Place at minimum viable position as fallback
                 let x = match float_type {
                     Float::Left => 0.0,
@@ -235,9 +241,10 @@ impl FloatContext {
         out
     }
 
-    /// The next y below `y` at which the float configuration changes.
+    /// The next y below `y` at which the float configuration changes, or `y`
+    /// itself when nothing changes further down.
     pub fn next_y_after(&self, y: f32, height: f32) -> f32 {
-        self.next_y_position(y, height)
+        self.next_y_position(y, height).unwrap_or(y)
     }
 
     /// Get the y position that clears floats according to the clear property.
@@ -281,7 +288,7 @@ impl FloatContext {
     }
 
     /// Find the next y position where the available space might change.
-    fn next_y_position(&self, current_y: f32, height: f32) -> f32 {
+    fn next_y_position(&self, current_y: f32, height: f32) -> Option<f32> {
         let bottom = current_y + height;
 
         // Find all floats that overlap the current [y, bottom) range
@@ -298,12 +305,11 @@ impl FloatContext {
             }
         }
 
-        // Return the smallest position greater than current_y
+        // The smallest position greater than current_y, if any.
         next_positions
             .into_iter()
             .filter(|&y| y > current_y)
             .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap_or(current_y + 1.0)
     }
 
     /// Get the bottom edge of the lowest float in a list.
@@ -594,10 +600,15 @@ mod tests {
         let frag = create_fragment(150.0, 50.0, 0.0);
         let placed = ctx.place_float(frag, Float::Left, 0.0);
 
-        // Float wider than containing block triggers safety fallback after searching
-        // Algorithm increments y until safety limit (cursor_y + 100000)
-        assert!(placed.position.y > 100000.0);
+        // Nothing below would make room, so it stays at the top and
+        // overflows (it used to be pushed 100,000px down the page).
+        assert_eq!(placed.position.y, 0.0);
         assert_eq!(placed.position.x, 0.0);
+        // Beside an earlier float it drops below that float, not further.
+        let mut ctx = FloatContext::new(100.0);
+        ctx.place_float(create_fragment(60.0, 40.0, 0.0), Float::Left, 0.0);
+        let placed = ctx.place_float(create_fragment(150.0, 50.0, 0.0), Float::Left, 0.0);
+        assert_eq!(placed.position.y, 40.0);
     }
 
     #[test]

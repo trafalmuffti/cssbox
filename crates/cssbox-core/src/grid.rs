@@ -214,6 +214,9 @@ fn span_size(sizes: &[f32], from: usize, to: usize, gap: f32) -> f32 {
     total
 }
 
+/// Highest grid line number honoured (and longest span).
+const MAX_LINE: usize = 10_000;
+
 /// One axis of an item's placement before auto-placement.
 #[derive(Clone, Copy, Debug)]
 struct Axis {
@@ -226,7 +229,11 @@ struct Axis {
 impl Axis {
     /// Resolve `grid-*-start` / `grid-*-end` for an explicit grid of `n` tracks.
     fn from(start: &GridPlacement, end: &GridPlacement, explicit: usize) -> Axis {
+        // Like Firefox, the grid is limited to MAX_LINE lines each way, so
+        // `grid-row: span 99999` cannot create a hundred thousand tracks.
+        let span = |k: u32| (k as usize).clamp(1, MAX_LINE);
         let line = |n: i32| -> Option<usize> {
+            let n = n.clamp(-(MAX_LINE as i32), MAX_LINE as i32);
             if n > 0 {
                 Some((n - 1) as usize)
             } else if n < 0 {
@@ -256,7 +263,7 @@ impl Axis {
             },
             (GridPlacement::Line(a), GridPlacement::Span(k)) => Axis {
                 start: line(*a),
-                span: (*k as usize).max(1),
+                span: span(*k),
             },
             (GridPlacement::Line(a), _) => Axis {
                 start: line(*a),
@@ -264,7 +271,7 @@ impl Axis {
             },
             (GridPlacement::Span(k), GridPlacement::Line(b)) => match line(*b) {
                 Some(b) => {
-                    let span = (*k as usize).max(1);
+                    let span = span(*k);
                     Axis {
                         start: Some(b.saturating_sub(span)),
                         span,
@@ -272,12 +279,12 @@ impl Axis {
                 }
                 None => Axis {
                     start: None,
-                    span: (*k as usize).max(1),
+                    span: span(*k),
                 },
             },
             (GridPlacement::Span(k), _) => Axis {
                 start: None,
-                span: (*k as usize).max(1),
+                span: span(*k),
             },
             (_, GridPlacement::Line(b)) => match line(*b) {
                 Some(b) if b > 0 => Axis {
@@ -291,7 +298,7 @@ impl Axis {
             },
             (_, GridPlacement::Span(k)) => Axis {
                 start: None,
-                span: (*k as usize).max(1),
+                span: span(*k),
             },
             _ => Axis {
                 start: None,
@@ -319,7 +326,6 @@ fn place_items(
     n_explicit_rows: usize,
     style: &ComputedStyle,
 ) -> (usize, usize) {
-    use std::collections::HashSet;
     let column_flow = matches!(
         style.grid_auto_flow,
         GridAutoFlow::Column | GridAutoFlow::ColumnDense
@@ -330,18 +336,23 @@ fn place_items(
     );
     let mut cols = n_cols;
     let mut rows = n_explicit_rows.max(1);
-    let mut taken: HashSet<(usize, usize)> = HashSet::new();
-    let free = |taken: &HashSet<(usize, usize)>, r: usize, c: usize, rs: usize, cs: usize| {
-        (r..r + rs).all(|rr| (c..c + cs).all(|cc| !taken.contains(&(rr, cc))))
+    // Occupancy as the placed areas (row, col, row span, col span) rather
+    // than one entry per cell: a single item spanning thousands of tracks
+    // in both directions would otherwise cost millions of cells.
+    let mut taken: Vec<(usize, usize, usize, usize)> = Vec::new();
+    // The first placed area overlapping the candidate, if any. Every position
+    // before that area's far edge (in the search direction) overlaps it too,
+    // so the search can jump straight past it.
+    let collision = |taken: &[(usize, usize, usize, usize)],
+                     r: usize,
+                     c: usize,
+                     rs: usize,
+                     cs: usize| {
+        taken
+            .iter()
+            .copied()
+            .find(|&(tr, tc, trs, tcs)| r < tr + trs && tr < r + rs && c < tc + tcs && tc < c + cs)
     };
-    let mark = |taken: &mut HashSet<(usize, usize)>, r: usize, c: usize, rs: usize, cs: usize| {
-        for rr in r..r + rs {
-            for cc in c..c + cs {
-                taken.insert((rr, cc));
-            }
-        }
-    };
-
     // Items with both axes definite go first.
     for it in items.iter_mut() {
         it.row_span = it.row.span;
@@ -349,7 +360,7 @@ fn place_items(
         if let (Some(r), Some(c)) = (it.row.start, it.col.start) {
             it.row_start = r;
             it.col_start = c;
-            mark(&mut taken, r, c, it.row_span, it.col_span);
+            taken.push((r, c, it.row_span, it.col_span));
             cols = cols.max(c + it.col_span);
             rows = rows.max(r + it.row_span);
         }
@@ -376,13 +387,13 @@ fn place_items(
                     c += 1;
                     continue;
                 }
-                if free(&taken, r, c, rs, cs) {
+                let Some((tr, tc, trs, tcs)) = collision(&taken, r, c, rs, cs) else {
                     break;
-                }
+                };
                 if it.row.start.is_some() {
-                    c += 1;
+                    c = tc + tcs;
                 } else {
-                    r += 1;
+                    r = tr + trs;
                 }
             }
             it.row_start = r;
@@ -405,13 +416,13 @@ fn place_items(
                     r += 1;
                     continue;
                 }
-                if free(&taken, r, c, rs, cs) {
+                let Some((tr, tc, trs, tcs)) = collision(&taken, r, c, rs, cs) else {
                     break;
-                }
+                };
                 if it.col.start.is_some() {
-                    r += 1;
+                    r = tr + trs;
                 } else {
-                    c += 1;
+                    c = tc + tcs;
                 }
             }
             it.row_start = r;
@@ -421,7 +432,7 @@ fn place_items(
                 cur_c = c + cs;
             }
         }
-        mark(&mut taken, it.row_start, it.col_start, rs, cs);
+        taken.push((it.row_start, it.col_start, rs, cs));
         cols = cols.max(it.col_start + cs);
         rows = rows.max(it.row_start + rs);
     }
@@ -838,6 +849,33 @@ mod tests {
         assert!((r1.y - 0.0).abs() < 1.0);
         assert!((r2.y - 50.0).abs() < 1.0);
         assert!((r3.y - 50.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn huge_spans_are_limited_and_auto_placement_skips_them() {
+        let mut builder = BoxTreeBuilder::new();
+        let mut root_style = ComputedStyle {
+            display: Display::GRID,
+            ..ComputedStyle::block()
+        };
+        root_style.grid_template_columns =
+            vec![TrackDefinition::new(TrackSizingFunction::Fr(1.0)); 1000];
+        let root = builder.root(root_style);
+        // Spans every column and (asked for) 99999 rows.
+        let mut big = ComputedStyle::block();
+        big.grid_column_start = GridPlacement::Line(1);
+        big.grid_column_end = GridPlacement::Line(-1);
+        big.grid_row_start = GridPlacement::Span(99_999);
+        builder.element(root, big);
+        builder.element(root, ComputedStyle::block());
+        let tree = builder.build();
+        let start = std::time::Instant::now();
+        let result = compute_layout(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
+        assert!(start.elapsed().as_secs_f32() < 2.0, "took {:?}", start.elapsed());
+        // The auto item lands after the big one, in the first column.
+        let children = tree.children(tree.root());
+        let second = result.bounding_rect(children[1]).unwrap();
+        assert!(second.x.abs() < 1.0);
     }
 
     #[test]
