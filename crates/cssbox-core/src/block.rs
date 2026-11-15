@@ -6,7 +6,7 @@
 use crate::box_model::{resolve_block_width, BoxModel};
 use crate::float::FloatContext;
 use crate::fragment::{Fragment, FragmentKind};
-use crate::geometry::{Point, Size};
+use crate::geometry::{Point, Rect, Size};
 use crate::inline;
 use crate::layout::{self, LayoutContext};
 use crate::style::{BoxSizing, DisplayInner, Float};
@@ -24,11 +24,31 @@ pub fn layout_block(
     let forced_height = ctx.take_forced_height(node);
 
     // 1. Resolve width and margins
-    let (content_width, margin) = resolve_block_width(style, containing_block_width);
+    let (mut content_width, margin) = resolve_block_width(style, containing_block_width);
 
     // 2. Resolve border and padding
     let border = BoxModel::resolve_border(style);
     let padding = BoxModel::resolve_padding(style, containing_block_width);
+    if let Some(fw) = ctx.take_forced_width(node) {
+        content_width = (fw - border.horizontal() - padding.horizontal()).max(0.0);
+    }
+    // Percentage heights of children resolve against this box's height only
+    // when that is definite; otherwise they behave as `auto` (NaN = indefinite).
+    let child_cb_height = {
+        let def = match style.height.resolve(containing_block_height) {
+            Some(h) => Some(if style.box_sizing == BoxSizing::BorderBox {
+                (h - border.vertical() - padding.vertical()).max(0.0)
+            } else {
+                h
+            }),
+            None => forced_height.map(|h| (h - border.vertical() - padding.vertical()).max(0.0)),
+        };
+        def.unwrap_or(f32::NAN)
+    };
+    let establishes_cb = style.position.is_positioned();
+    if establishes_cb {
+        ctx.push_positioned_width(content_width + padding.horizontal());
+    }
 
     fragment.margin = margin;
     fragment.border = border;
@@ -62,7 +82,7 @@ pub fn layout_block(
             ctx,
             node,
             content_width,
-            containing_block_height,
+            child_cb_height,
             &mut fragment.children,
             &mut float_ctx,
         ),
@@ -135,6 +155,12 @@ pub fn layout_block(
     }
 
     fragment.size = Size::new(content_width, final_height);
+    if !style.establishes_bfc() {
+        ctx.escape_floats(node, float_ctx.own_floats());
+    }
+    if establishes_cb {
+        ctx.pop_positioned_width();
+    }
 
     fragment
 }
@@ -169,16 +195,46 @@ fn layout_block_children(
 
         // Handle out-of-flow elements
         if child_style.position.is_absolutely_positioned() {
-            // Absolutely positioned elements are laid out later in position::resolve_positioned
-            let mut child_fragment =
-                layout::layout_node(ctx, child_id, containing_width, containing_height);
-            child_fragment.position = Point::ZERO; // placeholder, resolved later
+            // Absolutely positioned elements are placed later in
+            // position::resolve_positioned; here we fix their width (which
+            // needs the containing block) and record the static position.
+            let fixed = child_style.position == crate::style::Position::Fixed;
+            let cb_w = ctx.abs_containing_width(fixed);
+            let bm = BoxModel::resolve(child_style, cb_w);
+            let left = child_style.left.resolve(cb_w);
+            let right = child_style.right.resolve(cb_w);
+            if child_style.width.is_auto() {
+                let bp = bm.horizontal_border_padding();
+                let ml = bm.margin.left;
+                let mr = bm.margin.right;
+                let w = match (left, right) {
+                    (Some(l), Some(r)) => cb_w - l - r - ml - mr,
+                    _ => {
+                        let avail =
+                            (cb_w - left.unwrap_or(0.0) - right.unwrap_or(0.0) - ml - mr).max(0.0);
+                        let (mn, mx) = crate::intrinsic::intrinsic_widths(ctx, child_id);
+                        let _ = bp;
+                        mn.max(avail).min(mx.max(mn))
+                    }
+                };
+                ctx.force_width(child_id, w.max(0.0));
+            }
+            let mut child_fragment = layout::layout_node(ctx, child_id, cb_w, containing_height);
+            let static_y = cursor_y + pending_margin.unwrap_or(0.0).max(0.0);
+            child_fragment.position = Point::new(child_fragment.margin.left, static_y);
             fragments.push(child_fragment);
             continue;
         }
 
         // Handle floats
         if child_style.float != Float::None {
+            // A float with `width: auto` is as wide as its content (shrink-to-fit).
+            if child_style.width.is_auto() && !child_style.display.is_table_part() {
+                let bm = BoxModel::resolve(child_style, containing_width);
+                let (mn, mx) = crate::intrinsic::intrinsic_widths(ctx, child_id);
+                let avail = (containing_width - bm.margin.horizontal()).max(0.0);
+                ctx.force_width(child_id, mn.max(avail).min(mx.max(mn)));
+            }
             let mut child_fragment =
                 layout::layout_node(ctx, child_id, containing_width, containing_height);
             // Floats keep their specified margins (no over-constrained
@@ -198,7 +254,11 @@ fn layout_block_children(
                 None => bm.margin.top,
             };
             let dx = bm.margin.left + bm.border.left + bm.padding.left;
-            let dy = cursor_y + est_offset + bm.border.top + bm.padding.top;
+            let mut top = cursor_y + est_offset;
+            if child_style.clear != crate::style::Clear::None {
+                top = top.max(float_ctx.clear(child_style.clear));
+            }
+            let dy = top + bm.border.top + bm.padding.top;
             ctx.pass_floats(child_id, float_ctx.exclusions_for_child(dx, dy));
         }
 
@@ -228,10 +288,40 @@ fn layout_block_children(
                 first_margin_top = None;
             }
         }
+        // A box that establishes its own formatting context (table, flow-root,
+        // overflow, flex, grid) must not overlap floats beside it: it is
+        // narrowed, moved next to them, or pushed below them (CSS 2.1 §9.5).
+        let mut x_shift = 0.0f32;
+        if child_style.establishes_bfc() && float_ctx.has_floats() {
+            let top = cursor_y + offset;
+            let mut y = top;
+            let is_table = child_style.display.is_table_part();
+            for _ in 0..24 {
+                let h = child_fragment.border_box().height.max(1.0);
+                let (left, avail) = float_ctx.available_width_at(y, h);
+                let w_outer =
+                    child_fragment.border_box().width + child_fragment.margin.horizontal();
+                if avail + 0.01 >= w_outer {
+                    x_shift = left;
+                    break;
+                }
+                if !is_table && child_style.width.is_auto() && avail > 1.0 {
+                    child_fragment = layout::layout_node(ctx, child_id, avail, containing_height);
+                    x_shift = left;
+                    break;
+                }
+                let ny = float_ctx.next_y_after(y, h);
+                if ny <= y {
+                    break;
+                }
+                y = ny;
+            }
+            offset += y - top;
+        }
         cursor_y += offset;
 
         // Position is the top-left of the border box, offset by the left margin.
-        child_fragment.position = Point::new(child_fragment.margin.left, cursor_y);
+        child_fragment.position = Point::new(child_fragment.margin.left + x_shift, cursor_y);
 
         let height = child_fragment.border_box().height;
         if height == 0.0 {
@@ -245,6 +335,19 @@ fn layout_block_children(
         } else {
             cursor_y += height;
             pending_margin = Some(margin_bottom);
+        }
+
+        // Floats inside a child that shares our block formatting context
+        // also affect what follows it.
+        if !child_style.establishes_bfc() {
+            let dx = child_fragment.position.x
+                + child_fragment.border.left
+                + child_fragment.padding.left;
+            let dy =
+                child_fragment.position.y + child_fragment.border.top + child_fragment.padding.top;
+            for (r, side) in ctx.take_escaped(child_id) {
+                float_ctx.add_escaped(Rect::new(r.x + dx, r.y + dy, r.width, r.height), side);
+            }
         }
 
         fragments.push(child_fragment);

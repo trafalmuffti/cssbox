@@ -73,6 +73,9 @@ pub fn layout_flex(
         Some(content_box_width)
     };
 
+    // Items resolve percentage heights against this container only if it is definite.
+    let containing_block_height = definite_height.unwrap_or(f32::NAN);
+
     // §9.2: Collect flex items
     let children = ctx.tree.children(node);
     let mut items: Vec<FlexItem> = Vec::new();
@@ -100,31 +103,45 @@ pub fn layout_flex(
         items.push(item);
     }
 
-    // §9.3: Determine the flex base size and hypothetical main size
-    // (already done in collect_flex_item)
+    // Gaps: modelled as extra trailing margin on every item along the main
+    // axis; the container's available main size grows by one gap to match.
+    let (main_gap, cross_gap) = if is_row {
+        (style.column_gap, style.row_gap)
+    } else {
+        (style.row_gap, style.column_gap)
+    };
+    for it in &mut items {
+        it.main_margin_end += main_gap;
+    }
 
     // §9.2: the main size; an auto-height column sizes to its content.
     let main_size = if is_row {
         content_box_width
     } else {
         definite_height.unwrap_or_else(|| {
-            items
+            let total: f32 = items
                 .iter()
                 .map(|i| i.hypothetical_main_size + i.main_margin())
-                .sum()
+                .sum();
+            if items.is_empty() {
+                0.0
+            } else {
+                total - main_gap
+            }
         })
     };
+    let line_main_size = main_size + main_gap;
 
     // §9.4: Determine the main size of the flex container (already done above)
 
     // §9.5: Collect flex items into flex lines
-    let lines = collect_flex_lines(&items, main_size, is_wrap);
+    let lines = collect_flex_lines(&items, line_main_size, is_wrap);
 
     // §9.7: Resolve flexible lengths + §9.4/9.5: cross sizes
     let mut resolved_lines = Vec::new();
 
     for line in &lines {
-        let resolved = resolve_flexible_lengths(line, &items, main_size);
+        let resolved = resolve_flexible_lengths(line, &items, line_main_size);
         resolved_lines.push(resolved);
     }
 
@@ -159,7 +176,8 @@ pub fn layout_flex(
     }
 
     // Determine final cross size of container
-    let total_cross: f32 = line_cross_sizes.iter().sum();
+    let total_cross: f32 = line_cross_sizes.iter().sum::<f32>()
+        + cross_gap * line_cross_sizes.len().saturating_sub(1) as f32;
     let container_cross = cross_size_available.unwrap_or(total_cross);
 
     // §9.9: Align items and distribute space
@@ -183,7 +201,7 @@ pub fn layout_flex(
             .iter()
             .map(|&i| resolved.sizes[&i] + items[i].main_margin())
             .sum();
-        let extra_main = (main_size - total_main).max(0.0);
+        let extra_main = (line_main_size - total_main).max(0.0);
         let (main_start, main_between) =
             distribute_justify(style.justify_content, extra_main, line.item_indices.len());
 
@@ -262,7 +280,7 @@ pub fn layout_flex(
             fragment.children.push(child_frag);
         }
 
-        cross_offset += line_cross + cross_between;
+        cross_offset += line_cross + cross_between + cross_gap;
     }
 
     // Set container size
@@ -341,15 +359,17 @@ fn collect_flex_item(
             };
             match main_size.resolve(reference) {
                 Some(v) => v,
+                None if is_row => {
+                    // Content-based: the max-content width (content box).
+                    let pb = box_model.padding.horizontal() + box_model.border.horizontal();
+                    let (_, max) = crate::intrinsic::intrinsic_widths(ctx, node);
+                    (max - pb).max(0.0)
+                }
                 None => {
                     // Content-based: layout to determine
                     let child_frag =
                         layout::layout_node(ctx, node, containing_width, containing_height);
-                    if is_row {
-                        child_frag.size.width
-                    } else {
-                        child_frag.size.height
-                    }
+                    child_frag.size.height
                 }
             }
         }
@@ -373,6 +393,15 @@ fn collect_flex_item(
         )
     };
 
+    // The automatic minimum size of an item without a definite width is its
+    // min-content size.
+    let min_main = if is_row && style.width.is_auto() {
+        let pb = box_model.padding.horizontal() + box_model.border.horizontal();
+        let (min_content, _) = crate::intrinsic::intrinsic_widths(ctx, node);
+        min_main.max((min_content - pb).max(0.0))
+    } else {
+        min_main
+    };
     let hypothetical = flex_base_size.max(min_main).min(max_main);
 
     let (main_margin_start, main_margin_end) = if is_row {

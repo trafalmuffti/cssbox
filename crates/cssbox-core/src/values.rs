@@ -13,6 +13,11 @@ impl LengthPercentage {
     pub fn resolve(&self, reference: f32) -> f32 {
         match self {
             LengthPercentage::Length(px) => *px,
+            // An indefinite (NaN) reference makes percentages zero.
+            LengthPercentage::Percentage(pct) if reference.is_nan() => {
+                let _ = pct;
+                0.0
+            }
             LengthPercentage::Percentage(pct) => reference * pct,
         }
     }
@@ -45,6 +50,8 @@ impl LengthPercentageAuto {
     pub fn resolve(&self, reference: f32) -> Option<f32> {
         match self {
             LengthPercentageAuto::Length(px) => Some(*px),
+            // A percentage of an indefinite (NaN) size behaves as `auto`.
+            LengthPercentageAuto::Percentage(_) if reference.is_nan() => None,
             LengthPercentageAuto::Percentage(pct) => Some(reference * pct),
             LengthPercentageAuto::Auto => None,
         }
@@ -80,6 +87,7 @@ impl LengthPercentageNone {
     pub fn resolve(&self, reference: f32) -> Option<f32> {
         match self {
             LengthPercentageNone::Length(px) => Some(*px),
+            LengthPercentageNone::Percentage(_) if reference.is_nan() => None,
             LengthPercentageNone::Percentage(pct) => Some(reference * pct),
             LengthPercentageNone::None => None,
         }

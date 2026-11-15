@@ -22,6 +22,8 @@ struct InlineItem {
     atomic: Option<AtomicBox>,
     /// A forced line break (a text node consisting of exactly `"\n"`).
     forced_break: bool,
+    /// An `inline-block` laid out as a block: its fragment, with margins set.
+    block: Option<Fragment>,
 }
 
 /// Resolved box model of an atomic inline box.
@@ -159,6 +161,12 @@ pub fn layout_inline_formatting_context(
                 );
 
             let item_fragment = match item.atomic {
+                _ if item.block.is_some() => {
+                    let mut f = item.block.clone().unwrap();
+                    f.position =
+                        Point::new(current_x + f.margin.left, vertical_offset + f.margin.top);
+                    f
+                }
                 Some(atomic) => {
                     let mut f = Fragment::new(item.node, FragmentKind::Box);
                     f.size = atomic.content;
@@ -290,6 +298,7 @@ fn collect_inline_items(
                         baseline: size.height * 0.8,
                         atomic: None,
                         forced_break: true,
+                        block: None,
                     });
                     continue;
                 }
@@ -306,8 +315,52 @@ fn collect_inline_items(
                     baseline,
                     atomic: None,
                     forced_break: false,
+                    block: None,
                 });
             }
+        } else if style.display == crate::style::Display::INLINE_BLOCK
+            && !ctx.tree.children(child).is_empty()
+        {
+            // An inline-block with content: lay it out as a block of shrink-to-fit
+            // width and place that fragment on the line.
+            let bm = BoxModel::resolve(style, max_width);
+            let margin_h = bm.margin.horizontal();
+            let outer_w = match style.width.resolve(max_width) {
+                Some(w) => {
+                    if style.box_sizing == BoxSizing::BorderBox {
+                        w
+                    } else {
+                        w + bm.horizontal_border_padding()
+                    }
+                }
+                None => {
+                    let (mn, mx) = crate::intrinsic::intrinsic_widths(ctx, child);
+                    let avail = (max_width - margin_h).max(0.0);
+                    mn.max(avail).min(mx.max(mn))
+                }
+            };
+            ctx.force_width(child, outer_w);
+            let mut frag = crate::layout::layout_node(ctx, child, max_width, ctx.viewport.height);
+            // Block width rules stretch the right margin of a box narrower than
+            // its container; an inline-block keeps the margins it specified.
+            frag.margin = bm.margin;
+            let outer = Size::new(
+                frag.border_box().width + frag.margin.horizontal(),
+                frag.border_box().height + frag.margin.vertical(),
+            );
+            let below = frag.margin.bottom
+                + frag.border.bottom
+                + frag.padding.bottom
+                + 0.2 * style.line_height.max(style.effective_font_size());
+            frag.position = Point::ZERO;
+            items.push(InlineItem {
+                node: child,
+                size: outer,
+                baseline: (outer.height - below).max(0.0),
+                atomic: None,
+                forced_break: false,
+                block: Some(frag),
+            });
         } else if let (Some(w), Some(h)) = (
             style.width.resolve(max_width),
             style.height.resolve(ctx.viewport.height),
@@ -341,6 +394,7 @@ fn collect_inline_items(
                     padding,
                 }),
                 forced_break: false,
+                block: None,
             });
         } else {
             // Inline-level element without an explicit size: approximate it
@@ -354,6 +408,7 @@ fn collect_inline_items(
                 baseline,
                 atomic: None,
                 forced_break: false,
+                block: None,
             });
         }
     }
@@ -705,5 +760,39 @@ mod tests {
         let last = p.children.last().unwrap();
         assert!(last.position.y >= 30.0);
         assert_eq!(last.size.width, 200.0);
+    }
+}
+
+#[cfg(test)]
+mod inline_block_tests {
+    use super::*;
+    use crate::layout::{compute_layout, FixedWidthTextMeasure};
+    use crate::style::{ComputedStyle, Display};
+    use crate::tree::BoxTreeBuilder;
+    use crate::values::LengthPercentageAuto;
+
+    #[test]
+    fn inline_blocks_share_a_line() {
+        let mut b = BoxTreeBuilder::new();
+        let root = b.root(ComputedStyle::block());
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let mut st = ComputedStyle::block();
+            st.display = Display::INLINE_BLOCK;
+            st.width = LengthPercentageAuto::px(100.0);
+            let ib = b.element(root, st);
+            let inner = b.element(ib, ComputedStyle::block());
+            b.text(inner, "x");
+            ids.push(ib);
+        }
+        let tree = b.build();
+        let result = compute_layout(&tree, &FixedWidthTextMeasure, Size::new(600.0, 400.0));
+        let rects: Vec<_> = ids
+            .iter()
+            .map(|i| result.bounding_rect(*i).unwrap())
+            .collect();
+        assert_eq!(rects[0].width, 100.0);
+        assert!(rects[1].x >= 100.0 && rects[1].y == rects[0].y, "{rects:?}");
+        assert!(rects[2].x >= 200.0 && rects[2].y == rects[0].y, "{rects:?}");
     }
 }

@@ -91,9 +91,18 @@ pub struct LayoutContext<'a> {
     /// cross size, or resolved main size in a column). Consumed when the box
     /// is laid out.
     forced_heights: core::cell::RefCell<Vec<(NodeId, f32)>>,
+    /// Border-box widths imposed on out-of-flow boxes (shrink-to-fit or
+    /// stretched between `left` and `right`). Consumed when laid out.
+    forced_widths: core::cell::RefCell<Vec<(NodeId, f32)>>,
+    /// Padding-box widths of the enclosing positioned boxes, innermost last.
+    /// The initial containing block (viewport) is the first entry.
+    positioned_widths: core::cell::RefCell<Vec<f32>>,
     /// Float exclusions handed from a block to a child that shares its
     /// block formatting context, in the child's content-box coordinates.
     inherited_floats: core::cell::RefCell<Vec<(NodeId, FloatList)>>,
+    /// Floats a block leaves behind in its parent's block formatting
+    /// context, in the block's content-box coordinates.
+    escaped_floats: core::cell::RefCell<Vec<(NodeId, FloatList)>>,
 }
 
 impl<'a> LayoutContext<'a> {
@@ -103,7 +112,10 @@ impl<'a> LayoutContext<'a> {
             text_measure,
             viewport,
             forced_heights: core::cell::RefCell::new(Vec::new()),
+            forced_widths: core::cell::RefCell::new(Vec::new()),
+            positioned_widths: core::cell::RefCell::new(vec![viewport.width]),
             inherited_floats: core::cell::RefCell::new(Vec::new()),
+            escaped_floats: core::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -113,11 +125,64 @@ impl<'a> LayoutContext<'a> {
         v.push((node, floats));
     }
 
+    pub(crate) fn escape_floats(&self, node: NodeId, floats: FloatList) {
+        if floats.is_empty() {
+            return;
+        }
+        let mut v = self.escaped_floats.borrow_mut();
+        v.retain(|(n, _)| *n != node);
+        v.push((node, floats));
+    }
+
+    pub(crate) fn take_escaped(&self, node: NodeId) -> FloatList {
+        let mut v = self.escaped_floats.borrow_mut();
+        match v.iter().position(|(n, _)| *n == node) {
+            Some(i) => v.swap_remove(i).1,
+            None => Vec::new(),
+        }
+    }
+
     pub(crate) fn take_floats(&self, node: NodeId) -> FloatList {
         let mut v = self.inherited_floats.borrow_mut();
         match v.iter().position(|(n, _)| *n == node) {
             Some(i) => v.swap_remove(i).1,
             None => Vec::new(),
+        }
+    }
+
+    pub(crate) fn force_width(&self, node: NodeId, width: f32) {
+        let mut v = self.forced_widths.borrow_mut();
+        v.retain(|(n, _)| *n != node);
+        v.push((node, width.max(0.0)));
+    }
+
+    pub(crate) fn take_forced_width(&self, node: NodeId) -> Option<f32> {
+        let mut v = self.forced_widths.borrow_mut();
+        let pos = v.iter().position(|(n, _)| *n == node)?;
+        Some(v.swap_remove(pos).1)
+    }
+
+    pub(crate) fn push_positioned_width(&self, w: f32) {
+        self.positioned_widths.borrow_mut().push(w);
+    }
+
+    pub(crate) fn pop_positioned_width(&self) {
+        let mut v = self.positioned_widths.borrow_mut();
+        if v.len() > 1 {
+            v.pop();
+        }
+    }
+
+    /// Width of the containing block for an absolutely positioned box.
+    pub(crate) fn abs_containing_width(&self, fixed: bool) -> f32 {
+        if fixed {
+            self.viewport.width
+        } else {
+            *self
+                .positioned_widths
+                .borrow()
+                .last()
+                .unwrap_or(&self.viewport.width)
         }
     }
 
