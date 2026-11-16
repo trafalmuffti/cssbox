@@ -55,6 +55,13 @@ pub fn layout_flex(
     let is_wrap = style.flex_wrap != FlexWrap::Nowrap;
     let _is_wrap_reverse = style.flex_wrap == FlexWrap::WrapReverse;
 
+    // A width imposed by the parent (shrink-to-fit inline-flex/inline-grid,
+    // or a box narrowed to fit beside floats), as a border-box width.
+    let content_box_width = match ctx.take_forced_width(node) {
+        Some(fw) => (fw - border.horizontal() - padding.horizontal()).max(0.0),
+        None => content_box_width,
+    };
+
     // A definite content height: specified, or imposed by a parent flex container.
     let forced = ctx.take_forced_height(node);
     let definite_height = match style.height.resolve(containing_block_height) {
@@ -223,8 +230,10 @@ pub fn layout_flex(
             let align = effective_align(style.align_items, ctx.tree.style(item.node).align_self);
             let item_style = ctx.tree.style(item.node);
             let item_box = BoxModel::resolve(item_style, content_box_width);
+            // (`main_margin` includes the gap, which is space between items,
+            // not part of the item: leave it out or the item absorbs it.)
             let (item_width, item_height) = if is_row {
-                (item_main + item.main_margin(), line_cross)
+                (item_main + item.main_margin() - main_gap, line_cross)
             } else {
                 (line_cross, item_main)
             };
@@ -710,6 +719,25 @@ mod tests {
     use crate::layout::{compute_layout, FixedWidthTextMeasure};
     use crate::style::ComputedStyle;
     use crate::tree::BoxTreeBuilder;
+
+    #[test]
+    fn gaps_stay_between_items_not_inside_them() {
+        let mut builder = BoxTreeBuilder::new();
+        let mut root_style = ComputedStyle::block();
+        root_style.display = Display::FLEX;
+        root_style.column_gap = 20.0;
+        let root = builder.root(root_style);
+        let mut item = ComputedStyle::block();
+        item.width = LengthPercentageAuto::Auto;
+        item.flex_basis = LengthPercentageAuto::px(50.0);
+        let a = builder.element(root, item.clone());
+        let b = builder.element(root, item);
+        let tree = builder.build();
+        let result = compute_layout(&tree, &FixedWidthTextMeasure, Size::new(400.0, 300.0));
+        let (ra, rb) = (result.bounding_rect(a).unwrap(), result.bounding_rect(b).unwrap());
+        assert_eq!(ra.width, 50.0);
+        assert_eq!(rb.x - (ra.x + ra.width), 20.0);
+    }
 
     #[test]
     fn test_flex_row_equal_items() {

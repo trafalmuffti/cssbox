@@ -43,6 +43,13 @@ pub fn layout_grid(
         .max(0.0),
     };
 
+    // A width imposed by the parent (shrink-to-fit inline-flex/inline-grid,
+    // or a box narrowed to fit beside floats), as a border-box width.
+    let content_width = match ctx.take_forced_width(node) {
+        Some(fw) => (fw - border.horizontal() - padding.horizontal()).max(0.0),
+        None => content_width,
+    };
+
     // A definite content height: specified, or imposed by a parent flex container.
     let forced = ctx.take_forced_height(node);
     let definite_height = match style.height.resolve(containing_block_height) {
@@ -343,16 +350,12 @@ fn place_items(
     // The first placed area overlapping the candidate, if any. Every position
     // before that area's far edge (in the search direction) overlaps it too,
     // so the search can jump straight past it.
-    let collision = |taken: &[(usize, usize, usize, usize)],
-                     r: usize,
-                     c: usize,
-                     rs: usize,
-                     cs: usize| {
-        taken
-            .iter()
-            .copied()
-            .find(|&(tr, tc, trs, tcs)| r < tr + trs && tr < r + rs && c < tc + tcs && tc < c + cs)
-    };
+    let collision =
+        |taken: &[(usize, usize, usize, usize)], r: usize, c: usize, rs: usize, cs: usize| {
+            taken.iter().copied().find(|&(tr, tc, trs, tcs)| {
+                r < tr + trs && tr < r + rs && c < tc + tcs && tc < c + cs
+            })
+        };
     // Items with both axes definite go first.
     for it in items.iter_mut() {
         it.row_span = it.row.span;
@@ -871,7 +874,11 @@ mod tests {
         let tree = builder.build();
         let start = std::time::Instant::now();
         let result = compute_layout(&tree, &FixedWidthTextMeasure, Size::new(800.0, 600.0));
-        assert!(start.elapsed().as_secs_f32() < 2.0, "took {:?}", start.elapsed());
+        assert!(
+            start.elapsed().as_secs_f32() < 2.0,
+            "took {:?}",
+            start.elapsed()
+        );
         // The auto item lands after the big one, in the first column.
         let children = tree.children(tree.root());
         let second = result.bounding_rect(children[1]).unwrap();

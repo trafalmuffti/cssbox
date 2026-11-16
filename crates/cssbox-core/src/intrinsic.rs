@@ -53,11 +53,40 @@ pub fn intrinsic_widths(ctx: &LayoutContext, node: NodeId) -> (f32, f32) {
         {
             let mut min: f32 = 0.0;
             let mut sum = 0.0;
+            let mut n = 0usize;
             for (mn, mx) in children_outer(ctx, node) {
                 min = min.max(mn);
                 sum += mx;
+                n += 1;
             }
-            (min, sum)
+            // Gaps between the items take room too.
+            (min, sum + style.column_gap * n.saturating_sub(1) as f32)
+        }
+        FormattingContextType::Grid if !style.grid_template_columns.is_empty() => {
+            // One child's width per column (fixed tracks count as themselves),
+            // plus the gaps between columns.
+            let mut child_min: f32 = 0.0;
+            let mut child_max: f32 = 0.0;
+            for (mn, mx) in children_outer(ctx, node) {
+                child_min = child_min.max(mn);
+                child_max = child_max.max(mx);
+            }
+            let cols = &style.grid_template_columns;
+            let gaps = style.column_gap * (cols.len() - 1) as f32;
+            let (mut min, mut max) = (gaps, gaps);
+            for t in cols {
+                match t.sizing {
+                    crate::style::TrackSizingFunction::Length(p) => {
+                        min += p;
+                        max += p;
+                    }
+                    _ => {
+                        min += child_min;
+                        max += child_max;
+                    }
+                }
+            }
+            (min, max)
         }
         _ => {
             let mut min: f32 = 0.0;

@@ -56,8 +56,15 @@ impl LineBox {
         }
     }
 
-    fn add_item(&mut self, item: InlineItem) {
+    /// `on_baseline`: the item is aligned by its baseline (not `top`,
+    /// `middle` or `bottom`, which are placed against the whole line).
+    fn add_item(&mut self, item: InlineItem, on_baseline: bool) {
         self.width += item.size.width;
+        if !on_baseline {
+            self.height = self.height.max(item.size.height);
+            self.items.push(item);
+            return;
+        }
         self.baseline = self.baseline.max(item.baseline);
         self.descent = self.descent.max(item.size.height - item.baseline);
         // Items are baseline-aligned, so the line must fit the tallest ascent
@@ -76,6 +83,13 @@ impl LineBox {
     fn used_width(&self) -> f32 {
         self.width
     }
+}
+
+fn on_baseline(ctx: &LayoutContext, item: &InlineItem) -> bool {
+    matches!(
+        ctx.tree.style(item.node).vertical_align,
+        VerticalAlign::Baseline | VerticalAlign::Length(_)
+    )
 }
 
 /// Layout an inline formatting context.
@@ -109,6 +123,7 @@ pub fn layout_inline_formatting_context(
 
     // Break into line boxes, narrowing each line by any floats beside it.
     let line_boxes = flow_lines(
+        ctx,
         &inline_items,
         containing_width,
         line_height,
@@ -212,6 +227,7 @@ pub fn layout_inline_formatting_context(
 /// Greedy line breaking where each line's available width can be reduced by
 /// floats. Returns (line, y, left offset, available width) per line.
 fn flow_lines(
+    ctx: &LayoutContext,
     items: &[InlineItem],
     containing_width: f32,
     line_height: f32,
@@ -253,12 +269,19 @@ fn flow_lines(
         while idx < items.len() {
             let item = &items[idx];
             if item.forced_break {
-                line.add_item(item.clone());
+                line.add_item(item.clone(), on_baseline(ctx, item));
                 idx += 1;
                 break;
             }
-            if line.is_empty() || !allow_wrapping || line.used_width() + item.size.width <= avail {
-                line.add_item(item.clone());
+            // A line holding only zero-width items (anchors, empty inlines)
+            // is still empty for breaking: an item too wide to fit goes on it
+            // rather than leaving a blank line above.
+            if line.is_empty()
+                || line.used_width() <= 0.0
+                || !allow_wrapping
+                || line.used_width() + item.size.width <= avail
+            {
+                line.add_item(item.clone(), on_baseline(ctx, item));
                 idx += 1;
             } else {
                 break;
@@ -318,11 +341,16 @@ fn collect_inline_items(
                     block: None,
                 });
             }
-        } else if style.display == crate::style::Display::INLINE_BLOCK
-            && !ctx.tree.children(child).is_empty()
+        } else if matches!(
+            style.display,
+            crate::style::Display::INLINE_BLOCK
+                | crate::style::Display::INLINE_FLEX
+                | crate::style::Display::INLINE_GRID
+        ) && !ctx.tree.children(child).is_empty()
         {
-            // An inline-block with content: lay it out as a block of shrink-to-fit
-            // width and place that fragment on the line.
+            // An inline-block (or inline-flex / inline-grid) with content: lay
+            // it out as a box of shrink-to-fit width, with its own formatting
+            // context inside, and place that fragment on the line.
             let bm = BoxModel::resolve(style, max_width);
             let margin_h = bm.margin.horizontal();
             let outer_w = match style.width.resolve(max_width) {
@@ -646,6 +674,25 @@ mod tests {
 
         assert_eq!(height, 0.0);
         assert_eq!(fragments.len(), 0);
+    }
+
+    #[test]
+    fn zero_width_items_do_not_push_an_overwide_item_to_a_new_line() {
+        let mut builder = BoxTreeBuilder::new();
+        let root = builder.root(ComputedStyle::block());
+        // A zero-width item (like an anchor) then an atomic box 1px too wide.
+        builder.text(root, "");
+        let mut img = ComputedStyle::inline();
+        img.display = crate::style::Display::INLINE_BLOCK;
+        img.width = crate::values::LengthPercentageAuto::px(101.0);
+        img.height = crate::values::LengthPercentageAuto::px(20.0);
+        builder.element(root, img);
+        let tree = builder.build();
+        let ctx = LayoutContext::new(&tree, &FixedWidthTextMeasure, Size::new(100.0, 600.0));
+        let mut fragments = Vec::new();
+        let mut float_ctx = FloatContext::new(100.0);
+        layout_inline_formatting_context(&ctx, root, 100.0, &mut fragments, &mut float_ctx);
+        assert_eq!(fragments.len(), 1, "a blank line was left above the box");
     }
 
     #[test]
